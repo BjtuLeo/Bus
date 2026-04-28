@@ -298,17 +298,33 @@ function buildTravelPath(startLat, startLng, targetLat, targetLng, routePoints) 
     ]
   }
 
-  const startIndex = findNearestRouteIndex(startLat, startLng, routePoints)
-  const endIndex = findNearestRouteIndexFrom(targetLat, targetLng, routePoints, Math.max(0, startIndex))
-
-  if (startIndex < 0 || endIndex < 0 || endIndex <= startIndex) {
+  const targetIndex = findNearestRouteIndex(targetLat, targetLng, routePoints)
+  if (targetIndex < 0) {
     return [
       { lat: startLat, lng: startLng },
       { lat: targetLat, lng: targetLng }
     ]
   }
 
-  const segment = routePoints.slice(startIndex, endIndex + 1)
+  let startIndex = 0
+  let bestDistance = Number.POSITIVE_INFINITY
+  for (let index = targetIndex; index >= 0; index -= 1) {
+    const point = routePoints[index]
+    const distance = distanceSquared(startLat, startLng, point.lat, point.lng)
+    if (distance < bestDistance) {
+      bestDistance = distance
+      startIndex = index
+    }
+  }
+
+  if (targetIndex <= startIndex) {
+    return [
+      { lat: startLat, lng: startLng },
+      { lat: targetLat, lng: targetLng }
+    ]
+  }
+
+  const segment = routePoints.slice(startIndex, targetIndex + 1)
   return [
     { lat: startLat, lng: startLng },
     ...segment,
@@ -449,20 +465,34 @@ function calculateVirtualStartPoint(routePoints, leg, remainingSeconds) {
     return leg?.from || leg?.to || { lat: 51.5074, lng: -0.1278 }
   }
 
-  const fromIndex = findNearestRouteIndex(leg.from.lat, leg.from.lng, routePoints)
-  const toIndex = findNearestRouteIndexFrom(leg.to.lat, leg.to.lng, routePoints, Math.max(0, fromIndex))
-  if (fromIndex < 0 || toIndex < 0 || toIndex <= fromIndex) {
+  const toIndex = findNearestRouteIndex(leg.to.lat, leg.to.lng, routePoints)
+  if (toIndex < 0) {
+    return leg.from
+  }
+
+  let fromIndex = 0
+  let bestDistance = Number.POSITIVE_INFINITY
+  for (let index = toIndex; index >= 0; index -= 1) {
+    const point = routePoints[index]
+    const distance = distanceSquared(leg.from.lat, leg.from.lng, point.lat, point.lng)
+    if (distance < bestDistance) {
+      bestDistance = distance
+      fromIndex = index
+    }
+  }
+
+  if (toIndex <= fromIndex) {
     return leg.from
   }
 
   const segmentDistance = routeDistanceMeters(routePoints, fromIndex, toIndex)
   const segmentDurationSeconds = Math.max(60, Number(leg.durationSeconds || Math.round((leg.durationMs || 60000) / 1000)))
-  const estimatedSpeed = Math.max(2.5, Math.min(12, segmentDistance / segmentDurationSeconds))
+  const estimatedSpeed = 4.5
   let remainingDistance = Math.min(segmentDistance, estimatedSpeed * Math.max(0, remainingSeconds))
 
   for (let index = toIndex; index > fromIndex; index -= 1) {
     const current = routePoints[index]
-    const previous = routePoints[index - 1]
+      const previous = routePoints[index - 1]
     const step = segmentDistanceMeters(previous, current)
     if (remainingDistance <= step) {
       const ratio = step <= 0 ? 0 : remainingDistance / step
@@ -474,7 +504,7 @@ function calculateVirtualStartPoint(routePoints, leg, remainingSeconds) {
     remainingDistance -= step
   }
 
-  return leg.from
+  return routePoints[Math.max(0, fromIndex)] || leg.from
 }
 
 function mapVehiclePlan(vehicle, stopLookup) {
@@ -672,10 +702,11 @@ function updateVehicleMarkers(vehicles = []) {
     existing.marker.setIcon(createDirectionalVehicleIcon(markerLabel, 0))
     existing.marker.setPopupContent(popupText)
     const currentLeg = existing.plan[existing.currentLegIndex]
-    existing.plan = plan
+    const newRemainingMs = resolveRemainingSeconds(vehicle, plan[0]) * 1000
 
     if (!currentLeg && plan.length > 0) {
       const currentPosition = existing.marker.getLatLng()
+      existing.plan = plan
       existing.currentLegIndex = 0
       existing.path = buildTravelPath(
         currentPosition.lat,
@@ -685,26 +716,13 @@ function updateVehicleMarkers(vehicles = []) {
         routePoints
       )
       existing.segmentStartTime = now
-      existing.segmentEndTime = now + resolveRemainingSeconds(vehicle, plan[0]) * 1000
+      existing.segmentEndTime = now + newRemainingMs
       existing.waitUntil = null
       existing.waitingPoint = plan[0].from
       return
     }
 
-    if (currentLeg && plan.length > 0 && currentLeg.toStopId === plan[0].toStopId) {
-      existing.plan[existing.currentLegIndex] = {
-        ...existing.plan[existing.currentLegIndex],
-        ...plan[0],
-        durationMs: resolveRemainingSeconds(vehicle, plan[0]) * 1000
-      }
-      existing.segmentEndTime = now + resolveRemainingSeconds(vehicle, plan[0]) * 1000
-      if (plan.length > 1) {
-        existing.plan.splice(existing.currentLegIndex + 1, existing.plan.length, ...plan.slice(1))
-      }
-      return
-    }
-
-    if (plan.length > 0 && (!existing.waitUntil || now >= existing.waitUntil)) {
+    if (currentLeg && plan.length > 0 && currentLeg.toStopId === plan[0].toStopId && existing.currentLegIndex === 0) {
       const currentPosition = existing.marker.getLatLng()
       existing.path = buildTravelPath(
         currentPosition.lat,
@@ -713,8 +731,47 @@ function updateVehicleMarkers(vehicles = []) {
         plan[0].to.lng,
         routePoints
       )
+      existing.plan = [
+        {
+          ...plan[0],
+          from: { ...plan[0].from, lat: currentPosition.lat, lng: currentPosition.lng },
+          durationMs: newRemainingMs
+        },
+        ...plan.slice(1)
+      ]
       existing.segmentStartTime = now
-      existing.segmentEndTime = now + resolveRemainingSeconds(vehicle, plan[0]) * 1000
+      existing.segmentEndTime = now + newRemainingMs
+      existing.waitUntil = null
+      existing.waitingPoint = { lat: currentPosition.lat, lng: currentPosition.lng }
+      return
+    }
+
+    if (currentLeg && plan.length > 0 && currentLeg.toStopId === plan[0].toStopId) {
+      existing.plan = [
+        {
+          ...existing.plan[existing.currentLegIndex],
+          ...plan[0],
+          durationMs: newRemainingMs
+        },
+        ...plan.slice(1)
+      ]
+      existing.segmentEndTime = now + newRemainingMs
+      return
+    }
+
+    if (plan.length > 0 && (!existing.waitUntil || now >= existing.waitUntil)) {
+      const currentPosition = existing.marker.getLatLng()
+      existing.plan = plan
+      existing.currentLegIndex = 0
+      existing.path = buildTravelPath(
+        currentPosition.lat,
+        currentPosition.lng,
+        plan[0].to.lat,
+        plan[0].to.lng,
+        routePoints
+      )
+      existing.segmentStartTime = now
+      existing.segmentEndTime = now + newRemainingMs
       existing.waitUntil = null
       existing.waitingPoint = plan[0].from
       return
