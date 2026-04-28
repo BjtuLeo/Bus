@@ -1,0 +1,7 @@
+server:
+  port: 8080
+
+tfl:
+  base-url: https://api.tfl.gov.uk
+  app-id: ${TFL_APP_ID:}
+  app-key: ${TFL_APP_KEY:}
