@@ -31,8 +31,6 @@ const vehicleMessage = ref('')
 
 const VEHICLE_REFRESH_MS = 25000
 const STATION_HOLD_MS = 2500
-const MAX_VISIBLE_VEHICLES = 6
-const MIN_ORDER_GAP = 2
 let vehicleRefreshTimer = null
 let vehicleAnimationFrame = null
 const vehicleMarkers = new Map()
@@ -396,48 +394,8 @@ function resolveRemainingSeconds(vehicle, firstLeg) {
   return 60
 }
 
-function getStopOrderLookup() {
-  const lookup = new Map()
-  ;(currentLineMap.value?.stops || []).forEach((stop, index) => {
-    lookup.set(stop.id, index)
-  })
-  return lookup
-}
-
-function selectVisibleVehicles(vehicles = [], stopOrderLookup = new Map()) {
-  if (vehicles.length <= MAX_VISIBLE_VEHICLES) {
-    return vehicles
-  }
-
-  const withProgress = vehicles
-    .map((vehicle) => ({
-      vehicle,
-      order: stopOrderLookup.get(vehicle.nextStopId) ?? Number.MAX_SAFE_INTEGER,
-      remaining: resolveRemainingSeconds(vehicle, vehicle.travelPlan?.[0])
-    }))
-    .sort((left, right) => {
-      if (left.order !== right.order) {
-        return left.order - right.order
-      }
-      return left.remaining - right.remaining
-    })
-
-  const selected = []
-  for (const item of withProgress) {
-    const tooClose = selected.some((picked) => Math.abs(picked.order - item.order) < MIN_ORDER_GAP)
-    if (!tooClose) {
-      selected.push(item)
-    }
-    if (selected.length >= MAX_VISIBLE_VEHICLES) {
-      break
-    }
-  }
-
-  if (selected.length === 0) {
-    return withProgress.slice(0, MAX_VISIBLE_VEHICLES).map((item) => item.vehicle)
-  }
-
-  return selected.map((item) => item.vehicle)
+function selectVisibleVehicles(vehicles = []) {
+  return vehicles.filter((vehicle) => vehicle?.vehicleId)
 }
 
 function calculateVirtualStartPoint(routePoints, leg, remainingSeconds) {
@@ -597,14 +555,16 @@ function animateVehicles(timestamp) {
 
     if (progress >= 1) {
       const completedLeg = entry.plan[entry.currentLegIndex]
+      entry.marker.setLatLng([completedLeg.to.lat, completedLeg.to.lng])
       entry.waitingPoint = completedLeg.to
-      entry.currentLegIndex += 1
-      const nextLeg = entry.plan[entry.currentLegIndex]
+      const nextLeg = entry.plan[entry.currentLegIndex + 1]
       if (nextLeg) {
+        entry.currentLegIndex += 1
         entry.waitUntil = timestamp + STATION_HOLD_MS
       } else {
-        entry.waitUntil = timestamp + STATION_HOLD_MS
-        entry.plan = []
+        entry.segmentStartTime = timestamp
+        entry.segmentEndTime = timestamp
+        entry.waitUntil = null
       }
       hasActiveAnimation = true
       return
@@ -639,9 +599,8 @@ function updateVehicleMarkers(vehicles = []) {
   }
 
   const stopLookup = getStopLookup()
-  const stopOrderLookup = getStopOrderLookup()
   const routePoints = getRoutePoints()
-  const visibleVehicles = selectVisibleVehicles(vehicles, stopOrderLookup)
+  const visibleVehicles = selectVisibleVehicles(vehicles)
   const nextIds = new Set(visibleVehicles.map((vehicle) => vehicle.vehicleId))
 
   vehicleMarkers.forEach((entry, vehicleId) => {
@@ -657,6 +616,8 @@ function updateVehicleMarkers(vehicles = []) {
     const directionText = vehicle.destinationName || '终点站'
     const nextStop = stopLookup.get(vehicle.nextStopId)
     const plan = mapVehiclePlan(vehicle, stopLookup)
+    const remainingSeconds = Number(vehicle.timeToStationSeconds ?? vehicle.timeToNextStopSeconds ?? 60)
+    const currentDurationMs = Math.max(1000, remainingSeconds * 1000)
     const popupText = `
       <div class="stop-popup">
         <strong>${markerLabel}路公交</strong>
@@ -670,7 +631,6 @@ function updateVehicleMarkers(vehicles = []) {
     const existing = vehicleMarkers.get(vehicle.vehicleId)
     if (!existing) {
       const firstLeg = plan[0]
-      const remainingSeconds = resolveRemainingSeconds(vehicle, firstLeg)
       const virtualStart = calculateVirtualStartPoint(
         routePoints,
         firstLeg || {
@@ -701,7 +661,7 @@ function updateVehicleMarkers(vehicles = []) {
         currentLegIndex: 0,
         path,
         segmentStartTime: now + virtualStart.holdMs,
-        segmentEndTime: now + remainingSeconds * 1000,
+        segmentEndTime: now + currentDurationMs,
         waitUntil: null,
         waitingPoint: { lat: virtualStart.lat, lng: virtualStart.lng }
       })
@@ -711,7 +671,7 @@ function updateVehicleMarkers(vehicles = []) {
     existing.marker.setIcon(createDirectionalVehicleIcon(markerLabel, 0))
     existing.marker.setPopupContent(popupText)
     const currentLeg = existing.plan[existing.currentLegIndex]
-    const newRemainingMs = resolveRemainingSeconds(vehicle, plan[0]) * 1000
+    const newRemainingMs = currentDurationMs
 
     if (!currentLeg && plan.length > 0) {
       existing.plan = plan
@@ -748,6 +708,9 @@ function updateVehicleMarkers(vehicles = []) {
         const newTotalDuration = newRemainingMs / remainingProgress
         existing.segmentEndTime = now + newRemainingMs
         existing.segmentStartTime = existing.segmentEndTime - newTotalDuration
+      } else if (currentProgress >= 1) {
+        existing.segmentStartTime = now
+        existing.segmentEndTime = now + newRemainingMs
       }
       return
     }
