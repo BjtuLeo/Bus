@@ -254,28 +254,8 @@ function getRouteProgress(lat, lng, routePoints) {
   return routePoints.length > 1 ? index / (routePoints.length - 1) : 0
 }
 
-function findNearestRouteIndexFrom(lat, lng, routePoints, startIndex = 0) {
-  if (!routePoints.length) {
-    return -1
-  }
-
-  let bestIndex = Math.max(0, Math.min(startIndex, routePoints.length - 1))
-  let bestDistance = Number.POSITIVE_INFINITY
-  for (let index = bestIndex; index < routePoints.length; index += 1) {
-    const point = routePoints[index]
-    const distance = distanceSquared(lat, lng, point.lat, point.lng)
-    if (distance < bestDistance) {
-      bestDistance = distance
-      bestIndex = index
-    }
-  }
-  return bestIndex
-}
-
 function segmentDistanceMeters(start, end) {
-  const dx = (end.lng - start.lng) * 111320 * Math.cos(((start.lat + end.lat) / 2) * Math.PI / 180)
-  const dy = (end.lat - start.lat) * 110540
-  return Math.sqrt(dx * dx + dy * dy)
+  return L.CRS.Earth.distance(L.latLng(start.lat, start.lng), L.latLng(end.lat, end.lng))
 }
 
 function routeDistanceMeters(routePoints, startIndex, endIndex) {
@@ -306,7 +286,7 @@ function buildTravelPath(startLat, startLng, targetLat, targetLng, routePoints) 
     ]
   }
 
-  let startIndex = 0
+  let startIndex = targetIndex
   let bestDistance = Number.POSITIVE_INFINITY
   for (let index = targetIndex; index >= 0; index -= 1) {
     const point = routePoints[index]
@@ -462,15 +442,24 @@ function selectVisibleVehicles(vehicles = [], stopOrderLookup = new Map()) {
 
 function calculateVirtualStartPoint(routePoints, leg, remainingSeconds) {
   if (!leg?.from || !leg?.to || !routePoints.length) {
-    return leg?.from || leg?.to || { lat: 51.5074, lng: -0.1278 }
+    const fallback = leg?.from || leg?.to || { lat: 51.5074, lng: -0.1278 }
+    return {
+      lat: fallback.lat,
+      lng: fallback.lng,
+      holdMs: 0
+    }
   }
 
   const toIndex = findNearestRouteIndex(leg.to.lat, leg.to.lng, routePoints)
   if (toIndex < 0) {
-    return leg.from
+    return {
+      lat: leg.from.lat,
+      lng: leg.from.lng,
+      holdMs: 0
+    }
   }
 
-  let fromIndex = 0
+  let fromIndex = toIndex
   let bestDistance = Number.POSITIVE_INFINITY
   for (let index = toIndex; index >= 0; index -= 1) {
     const point = routePoints[index]
@@ -482,29 +471,49 @@ function calculateVirtualStartPoint(routePoints, leg, remainingSeconds) {
   }
 
   if (toIndex <= fromIndex) {
-    return leg.from
+    return {
+      lat: leg.from.lat,
+      lng: leg.from.lng,
+      holdMs: 0
+    }
   }
 
   const segmentDistance = routeDistanceMeters(routePoints, fromIndex, toIndex)
-  const segmentDurationSeconds = Math.max(60, Number(leg.durationSeconds || Math.round((leg.durationMs || 60000) / 1000)))
-  const estimatedSpeed = 4.5
-  let remainingDistance = Math.min(segmentDistance, estimatedSpeed * Math.max(0, remainingSeconds))
+  const estimatedSpeed = 5
+  const normalizedRemainingSeconds = Math.max(0, Number(remainingSeconds) || 0)
+  let remainingDistance = estimatedSpeed * normalizedRemainingSeconds
+
+  if (remainingDistance >= segmentDistance) {
+    const holdSeconds = (remainingDistance - segmentDistance) / estimatedSpeed
+    const routeStart = routePoints[0] || leg.from
+    return {
+      lat: routeStart.lat,
+      lng: routeStart.lng,
+      holdMs: Math.max(0, holdSeconds * 1000)
+    }
+  }
 
   for (let index = toIndex; index > fromIndex; index -= 1) {
     const current = routePoints[index]
-      const previous = routePoints[index - 1]
+    const previous = routePoints[index - 1]
     const step = segmentDistanceMeters(previous, current)
     if (remainingDistance <= step) {
       const ratio = step <= 0 ? 0 : remainingDistance / step
       return {
         lat: current.lat + (previous.lat - current.lat) * ratio,
-        lng: current.lng + (previous.lng - current.lng) * ratio
+        lng: current.lng + (previous.lng - current.lng) * ratio,
+        holdMs: 0
       }
     }
     remainingDistance -= step
   }
 
-  return routePoints[Math.max(0, fromIndex)] || leg.from
+  const routeStart = routePoints[Math.max(0, fromIndex)] || leg.from
+  return {
+    lat: routeStart.lat,
+    lng: routeStart.lng,
+    holdMs: 0
+  }
 }
 
 function mapVehiclePlan(vehicle, stopLookup) {
@@ -691,10 +700,10 @@ function updateVehicleMarkers(vehicles = []) {
         plan,
         currentLegIndex: 0,
         path,
-        segmentStartTime: now,
+        segmentStartTime: now + virtualStart.holdMs,
         segmentEndTime: now + remainingSeconds * 1000,
         waitUntil: null,
-        waitingPoint: firstLeg?.from ?? virtualStart
+        waitingPoint: { lat: virtualStart.lat, lng: virtualStart.lng }
       })
       return
     }
@@ -705,12 +714,11 @@ function updateVehicleMarkers(vehicles = []) {
     const newRemainingMs = resolveRemainingSeconds(vehicle, plan[0]) * 1000
 
     if (!currentLeg && plan.length > 0) {
-      const currentPosition = existing.marker.getLatLng()
       existing.plan = plan
       existing.currentLegIndex = 0
       existing.path = buildTravelPath(
-        currentPosition.lat,
-        currentPosition.lng,
+        existing.waitingPoint?.lat ?? plan[0].from.lat,
+        existing.waitingPoint?.lng ?? plan[0].from.lng,
         plan[0].to.lat,
         plan[0].to.lng,
         routePoints
@@ -723,26 +731,24 @@ function updateVehicleMarkers(vehicles = []) {
     }
 
     if (currentLeg && plan.length > 0 && currentLeg.toStopId === plan[0].toStopId && existing.currentLegIndex === 0) {
-      const currentPosition = existing.marker.getLatLng()
-      existing.path = buildTravelPath(
-        currentPosition.lat,
-        currentPosition.lng,
-        plan[0].to.lat,
-        plan[0].to.lng,
-        routePoints
-      )
+      const currentDuration = Math.max(1, existing.segmentEndTime - existing.segmentStartTime)
+      const currentProgress = Math.max(0, (now - existing.segmentStartTime) / currentDuration)
+      const remainingProgress = 1 - currentProgress
+
       existing.plan = [
         {
+          ...currentLeg,
           ...plan[0],
-          from: { ...plan[0].from, lat: currentPosition.lat, lng: currentPosition.lng },
           durationMs: newRemainingMs
         },
         ...plan.slice(1)
       ]
-      existing.segmentStartTime = now
-      existing.segmentEndTime = now + newRemainingMs
-      existing.waitUntil = null
-      existing.waitingPoint = { lat: currentPosition.lat, lng: currentPosition.lng }
+
+      if (currentProgress < 1 && remainingProgress > 0) {
+        const newTotalDuration = newRemainingMs / remainingProgress
+        existing.segmentEndTime = now + newRemainingMs
+        existing.segmentStartTime = existing.segmentEndTime - newTotalDuration
+      }
       return
     }
 
@@ -760,12 +766,11 @@ function updateVehicleMarkers(vehicles = []) {
     }
 
     if (plan.length > 0 && (!existing.waitUntil || now >= existing.waitUntil)) {
-      const currentPosition = existing.marker.getLatLng()
       existing.plan = plan
       existing.currentLegIndex = 0
       existing.path = buildTravelPath(
-        currentPosition.lat,
-        currentPosition.lng,
+        existing.waitingPoint?.lat ?? plan[0].from.lat,
+        existing.waitingPoint?.lng ?? plan[0].from.lng,
         plan[0].to.lat,
         plan[0].to.lng,
         routePoints
