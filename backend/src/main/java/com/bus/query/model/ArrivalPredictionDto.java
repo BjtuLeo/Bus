@@ -4,6 +4,7 @@ public record ArrivalPredictionDto(
         String destinationName,
         String expectedArrival,
         Integer timeToStationSeconds,
-        String vehicleId
+        String vehicleId,
+        boolean inferred
 ) {
 }

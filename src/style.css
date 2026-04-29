@@ -889,6 +889,11 @@ button {
   color: rgba(216, 228, 255, 0.5);
 }
 
+.arrival-meta {
+  margin-top: 4px;
+  color: #8eb0ff;
+}
+
 .arrival-item strong {
   color: #eef4ff;
   font-size: 0.96rem;

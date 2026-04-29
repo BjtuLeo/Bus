@@ -76,13 +76,15 @@ public class TflLineService {
 
         LinkedHashMap<String, StopMarkerDto> stops = extractStops(routeSequence);
         Map<String, List<ArrivalPredictionDto>> arrivalMap = extractArrivals(arrivals);
+        List<LineDirectionDto> directions = extractDirections(routeSequence, arrivalMap);
+        Map<String, List<ArrivalPredictionDto>> augmentedArrivalMap = buildAugmentedArrivalMap(arrivals, directions, arrivalMap);
 
         LinkedHashMap<String, StopMarkerDto> mergedStops = new LinkedHashMap<>();
         for (StopMarkerDto stop : stops.values()) {
-            List<ArrivalPredictionDto> predictions = arrivalMap.getOrDefault(stop.id(), List.of());
+            List<ArrivalPredictionDto> predictions = augmentedArrivalMap.getOrDefault(stop.id(), List.of());
             mergedStops.put(stop.id(), new StopMarkerDto(stop.id(), stop.name(), stop.lat(), stop.lng(), predictions));
         }
-        List<LineDirectionDto> directions = extractDirections(routeSequence, arrivalMap);
+        directions = applyArrivalsToDirections(directions, augmentedArrivalMap);
         if (directions.isEmpty()) {
             directions = List.of(new LineDirectionDto(
                     "default",
@@ -259,6 +261,134 @@ public class TflLineService {
         return directions;
     }
 
+    private List<LineDirectionDto> applyArrivalsToDirections(
+            List<LineDirectionDto> directions,
+            Map<String, List<ArrivalPredictionDto>> arrivalMap
+    ) {
+        return directions.stream()
+                .map(direction -> new LineDirectionDto(
+                        direction.id(),
+                        direction.label(),
+                        direction.destinationName(),
+                        direction.stops().stream()
+                                .map(stop -> new StopMarkerDto(
+                                        stop.id(),
+                                        stop.name(),
+                                        stop.lat(),
+                                        stop.lng(),
+                                        arrivalMap.getOrDefault(stop.id(), List.of())
+                                ))
+                                .toList()
+                ))
+                .toList();
+    }
+
+    private Map<String, List<ArrivalPredictionDto>> buildAugmentedArrivalMap(
+            JsonNode arrivals,
+            List<LineDirectionDto> directions,
+            Map<String, List<ArrivalPredictionDto>> baseArrivalMap
+    ) {
+        Map<String, List<ArrivalPredictionDto>> merged = new LinkedHashMap<>();
+        baseArrivalMap.forEach((stopId, predictions) -> merged.put(stopId, new ArrayList<>(predictions)));
+
+        if (!arrivals.isArray()) {
+            return sortAndDedupeArrivalMap(merged);
+        }
+
+        for (LineDirectionDto direction : directions) {
+            List<StopMarkerDto> stops = direction.stops();
+            if (stops.isEmpty()) {
+                continue;
+            }
+
+            Map<String, Integer> stopOrder = new HashMap<>();
+            for (int index = 0; index < stops.size(); index++) {
+                stopOrder.put(stops.get(index).id(), index);
+            }
+
+            Map<String, Integer> segmentDurationLookup = buildSegmentDurationLookup(arrivals, stopOrder);
+            Map<String, List<JsonNode>> vehiclePredictions = new LinkedHashMap<>();
+
+            for (JsonNode node : arrivals) {
+                String vehicleId = textValue(node, "vehicleId");
+                String stopId = textValue(node, "naptanId");
+                if (!StringUtils.hasText(vehicleId) || !stopOrder.containsKey(stopId)) {
+                    continue;
+                }
+                vehiclePredictions.computeIfAbsent(vehicleId, ignored -> new ArrayList<>()).add(node);
+            }
+
+            for (List<JsonNode> rawPredictions : vehiclePredictions.values()) {
+                List<JsonNode> predictions = sanitizePredictions(rawPredictions, stopOrder);
+                if (predictions.isEmpty()) {
+                    continue;
+                }
+
+                JsonNode anchorPrediction = predictions.get(0);
+                String destinationName = textValue(anchorPrediction, "destinationName");
+                int anchorSeconds = anchorPrediction.path("timeToStation").asInt(Integer.MAX_VALUE);
+                String anchorStopId = textValue(anchorPrediction, "naptanId");
+                Integer anchorOrder = stopOrder.get(anchorStopId);
+                if (anchorOrder == null || anchorSeconds == Integer.MAX_VALUE) {
+                    continue;
+                }
+
+                String vehicleId = textValue(anchorPrediction, "vehicleId");
+                int cumulativeSeconds = anchorSeconds;
+                for (int targetOrder = anchorOrder + 1; targetOrder < stops.size(); targetOrder++) {
+                    String previousStopId = stops.get(targetOrder - 1).id();
+                    String targetStopId = stops.get(targetOrder).id();
+                    String segmentKey = previousStopId + "->" + targetStopId;
+                    cumulativeSeconds += Math.max(60, segmentDurationLookup.getOrDefault(segmentKey, 180));
+
+                    merged.computeIfAbsent(targetStopId, ignored -> new ArrayList<>()).add(new ArrivalPredictionDto(
+                            destinationName,
+                            null,
+                            cumulativeSeconds,
+                            vehicleId,
+                            true
+                    ));
+                }
+            }
+        }
+
+        return sortAndDedupeArrivalMap(merged);
+    }
+
+    private Map<String, List<ArrivalPredictionDto>> sortAndDedupeArrivalMap(Map<String, List<ArrivalPredictionDto>> arrivalMap) {
+        Map<String, List<ArrivalPredictionDto>> normalized = new LinkedHashMap<>();
+
+        arrivalMap.forEach((stopId, predictions) -> {
+            Map<String, ArrivalPredictionDto> deduped = new LinkedHashMap<>();
+            predictions.stream()
+                    .sorted(Comparator.comparingInt(prediction ->
+                            prediction.timeToStationSeconds() == null ? Integer.MAX_VALUE : prediction.timeToStationSeconds()
+                    ))
+                    .forEach(prediction -> {
+                        String key = prediction.vehicleId() + "|" + prediction.destinationName();
+                        ArrivalPredictionDto existing = deduped.get(key);
+                        if (existing == null) {
+                            deduped.put(key, prediction);
+                            return;
+                        }
+
+                        int existingSeconds = existing.timeToStationSeconds() == null ? Integer.MAX_VALUE : existing.timeToStationSeconds();
+                        int nextSeconds = prediction.timeToStationSeconds() == null ? Integer.MAX_VALUE : prediction.timeToStationSeconds();
+                        if (nextSeconds < existingSeconds || (nextSeconds == existingSeconds && !prediction.inferred() && existing.inferred())) {
+                            deduped.put(key, prediction);
+                        }
+                    });
+
+            normalized.put(stopId, deduped.values().stream()
+                    .sorted(Comparator.comparingInt(prediction ->
+                            prediction.timeToStationSeconds() == null ? Integer.MAX_VALUE : prediction.timeToStationSeconds()
+                    ))
+                    .toList());
+        });
+
+        return normalized;
+    }
+
     private Map<String, List<ArrivalPredictionDto>> extractArrivals(JsonNode arrivals) {
         if (!arrivals.isArray()) {
             return Map.of();
@@ -276,16 +406,12 @@ public class TflLineService {
             }
 
             grouped.computeIfAbsent(stopId, ignored -> new ArrayList<>());
-            List<ArrivalPredictionDto> predictions = grouped.get(stopId);
-            if (predictions.size() >= 2) {
-                continue;
-            }
-
-            predictions.add(new ArrivalPredictionDto(
+            grouped.get(stopId).add(new ArrivalPredictionDto(
                     textValue(node, "destinationName"),
                     textValue(node, "expectedArrival"),
                     node.path("timeToStation").isMissingNode() ? null : node.path("timeToStation").asInt(),
-                    textValue(node, "vehicleId")
+                    textValue(node, "vehicleId"),
+                    false
             ));
         }
 

@@ -94,6 +94,7 @@ const expandedStop = computed(() => activeStops.value.find((stop) => stop.id ===
 
 const reminderTaskCount = computed(() => reminderTasks.value.length)
 const activeLineColor = computed(() => getLineColor(currentLineId.value || selectedLine.value?.id || '52'))
+const stationPredictionMap = computed(() => buildStationPredictionMap(activeStops.value))
 
 function selectSidebarItem(item) {
   if (item.type === 'city') {
@@ -294,8 +295,30 @@ function getArrivalPresentation(remainingSeconds) {
   }
 }
 
+function buildStationPredictionMap(stops = []) {
+  const grouped = new Map()
+
+  stops.forEach((stop) => {
+    const list = Array.isArray(stop.arrivals) ? stop.arrivals : []
+    const scopedList = [...list]
+
+    scopedList.sort((left, right) => {
+      const leftSeconds = Number(left?.timeToStationSeconds)
+      const rightSeconds = Number(right?.timeToStationSeconds)
+      const safeLeft = Number.isFinite(leftSeconds) ? leftSeconds : Number.MAX_SAFE_INTEGER
+      const safeRight = Number.isFinite(rightSeconds) ? rightSeconds : Number.MAX_SAFE_INTEGER
+      return safeLeft - safeRight
+    })
+
+    grouped.set(stop.id, scopedList.slice(0, 2))
+  })
+
+  return grouped
+}
+
 function getStopPredictions(stop) {
-  return (stop.arrivals || []).slice(0, 2).map((prediction, index) => {
+  const predictions = stationPredictionMap.value.get(stop.id) || []
+  return predictions.map((prediction, index) => {
     const remainingSeconds = getPredictionRemainingSeconds(prediction)
     const presentation = getArrivalPresentation(remainingSeconds)
     return {
@@ -303,6 +326,7 @@ function getStopPredictions(stop) {
       vehicleId: prediction.vehicleId,
       destinationName: formatDirectionLabel(prediction.destinationName || activeDirection.value?.destinationName || '终点站'),
       remainingSeconds,
+      inferred: Boolean(prediction.inferred),
       label: index === 0 ? '下一辆' : '下下辆',
       display: presentation.label,
       state: presentation.state
@@ -852,6 +876,7 @@ onBeforeUnmount(() => {
                   <div>
                     <small>{{ item.label }}</small>
                     <strong>{{ item.destinationName }}</strong>
+                    <small v-if="item.inferred" class="arrival-meta">推算预测</small>
                   </div>
                   <span class="arrival-time">{{ item.display }}</span>
                 </div>
