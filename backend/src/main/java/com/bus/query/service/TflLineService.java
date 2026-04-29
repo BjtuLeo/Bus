@@ -3,6 +3,7 @@ package com.bus.query.service;
 import com.bus.query.config.TflProperties;
 import com.bus.query.model.ArrivalPredictionDto;
 import com.bus.query.model.LatLngDto;
+import com.bus.query.model.LineDirectionDto;
 import com.bus.query.model.LineMapResponse;
 import com.bus.query.model.LineSearchItem;
 import com.bus.query.model.StopMarkerDto;
@@ -86,6 +87,15 @@ public class TflLineService {
             List<ArrivalPredictionDto> predictions = arrivalMap.getOrDefault(stop.id(), List.of());
             mergedStops.put(stop.id(), new StopMarkerDto(stop.id(), stop.name(), stop.lat(), stop.lng(), predictions));
         }
+        List<LineDirectionDto> directions = extractDirections(routeSequence, arrivalMap);
+        if (directions.isEmpty()) {
+            directions = List.of(new LineDirectionDto(
+                    "default",
+                    "全线站点",
+                    mergedStops.values().stream().reduce((first, second) -> second).map(StopMarkerDto::name).orElse("终点站"),
+                    new ArrayList<>(mergedStops.values())
+            ));
+        }
 
         List<LatLngDto> routePath = extractLineStrings(routeSequence);
         if (routePath.isEmpty()) {
@@ -96,14 +106,14 @@ public class TflLineService {
 
         List<VehiclePositionDto> vehicles = extractVehiclePositions(arrivals, mergedStops, routePath);
         String vehicleStatus = "ok";
-        String vehicleMessage = "已根据 TfL 到站预测计算车辆位置，前端会筛选显示代表性车辆";
+        String vehicleMessage = "已同步最新到站预测数据，可在侧边栏查看各站最近两辆车的预计到站时间";
 
         if (!arrivals.isArray() || arrivals.isEmpty()) {
             vehicleStatus = "empty";
-            vehicleMessage = "TfL 当前未返回 52 路到站预测数据，因此无法计算车辆位置";
+            vehicleMessage = "TfL 当前未返回这条线路的到站预测数据";
         } else if (vehicles.isEmpty()) {
             vehicleStatus = "unresolved";
-            vehicleMessage = "已拿到到站预测，但当前无法稳定映射到线路坐标，暂时无法显示车辆图标";
+            vehicleMessage = "线路和站点已加载，但当前缺少可用的到站预测明细";
         }
 
         return new LineMapResponse(
@@ -113,6 +123,7 @@ public class TflLineService {
                 LINE_52.city(),
                 routePath,
                 new ArrayList<>(mergedStops.values()),
+                directions,
                 vehicles,
                 vehicleStatus,
                 vehicleMessage
@@ -186,6 +197,71 @@ public class TflLineService {
             }
         }
         return stops;
+    }
+
+    private List<LineDirectionDto> extractDirections(
+            JsonNode routeSequence,
+            Map<String, List<ArrivalPredictionDto>> arrivalMap
+    ) {
+        JsonNode sequences = routeSequence.path("stopPointSequences");
+        if (!sequences.isArray()) {
+            return List.of();
+        }
+
+        List<LineDirectionDto> directions = new ArrayList<>();
+        int sequenceIndex = 0;
+
+        for (JsonNode sequence : sequences) {
+            JsonNode sequenceStops = sequence.path("stopPoint");
+            if (!sequenceStops.isArray()) {
+                sequenceStops = sequence.path("stopPoints");
+            }
+            if (!sequenceStops.isArray()) {
+                continue;
+            }
+
+            List<StopMarkerDto> orderedStops = new ArrayList<>();
+            for (JsonNode stopNode : sequenceStops) {
+                String id = textValue(stopNode, "id");
+                if (!StringUtils.hasText(id)) {
+                    continue;
+                }
+
+                double lat = stopNode.path("lat").asDouble(Double.NaN);
+                double lng = stopNode.path("lon").asDouble(Double.NaN);
+                if (Double.isNaN(lat) || Double.isNaN(lng)) {
+                    continue;
+                }
+
+                orderedStops.add(new StopMarkerDto(
+                        id,
+                        textValue(stopNode, "name"),
+                        lat,
+                        lng,
+                        arrivalMap.getOrDefault(id, List.of())
+                ));
+            }
+
+            if (orderedStops.isEmpty()) {
+                continue;
+            }
+
+            String destinationName = firstNonBlank(
+                    textValue(sequence, "destination"),
+                    textValue(sequence, "name"),
+                    orderedStops.get(orderedStops.size() - 1).name()
+            );
+
+            directions.add(new LineDirectionDto(
+                    "direction-" + sequenceIndex,
+                    "开往 " + destinationName,
+                    destinationName,
+                    orderedStops
+            ));
+            sequenceIndex += 1;
+        }
+
+        return directions;
     }
 
     private Map<String, List<ArrivalPredictionDto>> extractArrivals(JsonNode arrivals) {
@@ -605,5 +681,14 @@ public class TflLineService {
     private String textValue(JsonNode node, String field) {
         JsonNode value = node.path(field);
         return value.isMissingNode() || value.isNull() ? "" : value.asText("");
+    }
+
+    private String firstNonBlank(String... values) {
+        for (String value : values) {
+            if (StringUtils.hasText(value)) {
+                return value;
+            }
+        }
+        return "";
     }
 }

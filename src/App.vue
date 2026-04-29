@@ -5,7 +5,6 @@ import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 const navItems = ['线路总览', '实时地图', '到站提醒']
 
 const currentCity = ref('北京')
-
 const cityItems = [
   { name: '北京', type: 'city' },
   { name: '伦敦', type: 'city' },
@@ -13,47 +12,86 @@ const cityItems = [
   { name: '提醒中心', type: 'menu' }
 ]
 
-const routeStart = ref('')
-const routeEnd = ref('')
 const searchQuery = ref('')
 const lineSuggestions = ref([])
 const isSuggestionOpen = ref(false)
 const selectedLine = ref(null)
 const searchTimer = ref(null)
+
 const mapElement = ref(null)
 const leafletMap = ref(null)
 const londonMapReady = ref(false)
 const routeLayerGroup = ref(null)
-const vehicleLayerGroup = ref(null)
-const currentLineMap = ref(null)
-const vehicleStatus = ref('')
-const vehicleMessage = ref('')
 
-const VEHICLE_REFRESH_MS = 25000
-const STATION_HOLD_MS = 2500
-let vehicleRefreshTimer = null
-let vehicleAnimationFrame = null
-const vehicleMarkers = new Map()
+const currentLineMap = ref(null)
+const lineStatus = ref('')
+const lineStatusMessage = ref('')
+const lineMapUpdatedAt = ref(Date.now())
+const countdownNow = ref(Date.now())
+
+const activeDirectionId = ref('')
+const expandedStopId = ref('')
+const reminderForms = ref({})
+const reminderTasks = ref([])
+const reminderToasts = ref([])
+const isLinePanelOpen = ref(false)
+
+const LINE_REFRESH_MS = 25000
+const COUNTDOWN_TICK_MS = 1000
+
+let lineRefreshTimer = null
+let countdownTimer = null
+const stopMarkerLookup = new Map()
 
 const currentMapMeta = computed(() => {
   if (currentCity.value === '伦敦') {
     return {
       badge: '伦敦实时地图',
-      copy: '当前底图来自 OpenStreetMap，可在此继续叠加伦敦公交站点、车辆位置与线路覆盖层。'
+      copy: '地图展示当前选中线路的静态轨迹与站点，实时到站信息在右侧站点面板中查看。'
     }
   }
 
   return {
     badge: '北京地图接口预留区域',
-    copy: '当前为北京地图占位视图，后续可接入北京实时公交、车辆位置与站点覆盖层。'
+    copy: '当前为北京地图占位视图，后续可接入北京实时公交线路、站点与到站提醒数据。'
   }
 })
 
-function swapRoutePoints() {
-  const start = routeStart.value
-  routeStart.value = routeEnd.value
-  routeEnd.value = start
-}
+const directionOptions = computed(() => {
+  const directions = currentLineMap.value?.directions
+  if (Array.isArray(directions) && directions.length > 0) {
+    return directions
+  }
+
+  const fallbackStops = Array.isArray(currentLineMap.value?.stops) ? currentLineMap.value.stops : []
+  if (!fallbackStops.length) {
+    return []
+  }
+
+  return [
+    {
+      id: 'default',
+      label: '全线站点',
+      destinationName: fallbackStops.at(-1)?.name || '终点站',
+      stops: fallbackStops
+    }
+  ]
+})
+
+const activeDirection = computed(() => {
+  const directions = directionOptions.value
+  if (!directions.length) {
+    return null
+  }
+
+  return directions.find((item) => item.id === activeDirectionId.value) || directions[0]
+})
+
+const activeStops = computed(() => activeDirection.value?.stops || [])
+
+const expandedStop = computed(() => activeStops.value.find((stop) => stop.id === expandedStopId.value) || null)
+
+const reminderTaskCount = computed(() => reminderTasks.value.length)
 
 function selectSidebarItem(item) {
   if (item.type === 'city') {
@@ -68,7 +106,6 @@ async function ensureLondonMap() {
   }
 
   await nextTick()
-
   if (!mapElement.value) {
     return
   }
@@ -92,38 +129,14 @@ function clearRouteLayer() {
   if (routeLayerGroup.value) {
     routeLayerGroup.value.clearLayers()
   }
+  stopMarkerLookup.clear()
 }
 
-function clearVehicleLayer() {
-  if (vehicleLayerGroup.value) {
-    vehicleLayerGroup.value.clearLayers()
-  }
-  vehicleMarkers.clear()
-}
-
-function formatArrival(prediction) {
-  if (!prediction?.timeToStationSeconds && prediction?.timeToStationSeconds !== 0) {
-    return '暂无到站预测'
-  }
-  const minutes = Math.max(1, Math.round(prediction.timeToStationSeconds / 60))
-  return `${minutes} 分钟后到达`
-}
-
-function buildPopup(stop) {
-  const predictions = stop.arrivals?.length
-    ? stop.arrivals
-        .slice(0, 2)
-        .map((item, index) => {
-          const label = index === 0 ? '下一辆' : '下下辆'
-          return `<div>${label}：${item.destinationName || '52路'} · ${formatArrival(item)}</div>`
-        })
-        .join('')
-    : '<div>下一辆：暂无到站预测</div><div>下下辆：暂无到站预测</div>'
-
+function buildStopPopup(stop) {
   return `
     <div class="stop-popup">
       <strong>${stop.name}</strong>
-      <div>${predictions}</div>
+      <div>点击右侧站点卡片可查看最近两辆车到站信息</div>
     </div>
   `
 }
@@ -159,8 +172,9 @@ function renderLineOnMap(lineMap, shouldFit = true) {
       weight: 3,
       fillColor: '#ffffff',
       fillOpacity: 1
-    }).bindPopup(buildPopup(stop))
+    }).bindPopup(buildStopPopup(stop))
 
+    stopMarkerLookup.set(stop.id, marker)
     routeLayerGroup.value.addLayer(marker)
     layers.push(marker)
   })
@@ -169,602 +183,235 @@ function renderLineOnMap(lineMap, shouldFit = true) {
     const bounds = L.featureGroup(layers).getBounds()
     if (shouldFit && bounds.isValid()) {
       leafletMap.value.fitBounds(bounds, {
-        padding: [60, 60]
+        padding: [70, 70]
       })
     }
   }
 }
 
-function createVehicleIcon(lineName) {
-  return createDirectionalVehicleIcon(lineName, 0)
+function getDirectionBadge(index) {
+  return index + 1 < 10 ? `0${index + 1}` : `${index + 1}`
 }
 
-function createDirectionalVehicleIcon(lineName, bearing = 0) {
-  const safeBearing = Number.isFinite(bearing) ? bearing : 0
-
-  return L.divIcon({
-    className: 'bus-vehicle-wrapper',
-    html: `
-      <div class="bus-vehicle-chip">
-      <div class="bus-vehicle-rotator" style="transform: rotate(${safeBearing}deg);">
-        <span class="bus-vehicle-arrow"></span>
-        <svg class="bus-vehicle-svg" viewBox="0 0 64 64" aria-hidden="true">
-          <rect x="14" y="10" width="36" height="34" rx="8"></rect>
-          <rect x="20" y="16" width="24" height="10" rx="2" class="bus-window"></rect>
-          <rect x="20" y="29" width="10" height="11" rx="2" class="bus-window"></rect>
-          <rect x="34" y="29" width="10" height="11" rx="2" class="bus-window"></rect>
-          <circle cx="22" cy="48" r="4" class="bus-wheel"></circle>
-          <circle cx="42" cy="48" r="4" class="bus-wheel"></circle>
-        </svg>
-      </div>
-      <span class="bus-vehicle-line">${lineName}</span>
-      </div>
-    `,
-    iconSize: [44, 44],
-    iconAnchor: [22, 22]
-  })
-}
-
-function getStopLookup() {
-  const lookup = new Map()
-  ;(currentLineMap.value?.stops || []).forEach((stop) => {
-    lookup.set(stop.id, stop)
-  })
-  return lookup
-}
-
-function getRoutePoints() {
-  return (currentLineMap.value?.routePath || []).map((point) => ({
-    lat: point.lat,
-    lng: point.lng
-  }))
-}
-
-function distanceSquared(aLat, aLng, bLat, bLng) {
-  const latDiff = aLat - bLat
-  const lngDiff = aLng - bLng
-  return latDiff * latDiff + lngDiff * lngDiff
-}
-
-function findNearestRouteIndex(lat, lng, routePoints) {
-  if (!routePoints.length) {
-    return -1
-  }
-
-  let bestIndex = 0
-  let bestDistance = Number.POSITIVE_INFINITY
-  routePoints.forEach((point, index) => {
-    const distance = distanceSquared(lat, lng, point.lat, point.lng)
-    if (distance < bestDistance) {
-      bestDistance = distance
-      bestIndex = index
-    }
-  })
-
-  return bestIndex
-}
-
-function getRouteProgress(lat, lng, routePoints) {
-  if (!routePoints.length) {
-    return 0
-  }
-  const index = findNearestRouteIndex(lat, lng, routePoints)
-  return routePoints.length > 1 ? index / (routePoints.length - 1) : 0
-}
-
-function segmentDistanceMeters(start, end) {
-  return L.CRS.Earth.distance(L.latLng(start.lat, start.lng), L.latLng(end.lat, end.lng))
-}
-
-function routeDistanceMeters(routePoints, startIndex, endIndex) {
-  if (!routePoints.length || endIndex <= startIndex) {
-    return 0
-  }
-
-  let total = 0
-  for (let index = startIndex + 1; index <= endIndex; index += 1) {
-    total += segmentDistanceMeters(routePoints[index - 1], routePoints[index])
-  }
-  return total
-}
-
-function buildTravelPath(startLat, startLng, targetLat, targetLng, routePoints) {
-  if (!routePoints.length) {
-    return [
-      { lat: startLat, lng: startLng },
-      { lat: targetLat, lng: targetLng }
-    ]
-  }
-
-  const targetIndex = findNearestRouteIndex(targetLat, targetLng, routePoints)
-  if (targetIndex < 0) {
-    return [
-      { lat: startLat, lng: startLng },
-      { lat: targetLat, lng: targetLng }
-    ]
-  }
-
-  let startIndex = targetIndex
-  let bestDistance = Number.POSITIVE_INFINITY
-  for (let index = targetIndex; index >= 0; index -= 1) {
-    const point = routePoints[index]
-    const distance = distanceSquared(startLat, startLng, point.lat, point.lng)
-    if (distance < bestDistance) {
-      bestDistance = distance
-      startIndex = index
-    }
-  }
-
-  if (targetIndex <= startIndex) {
-    return [
-      { lat: startLat, lng: startLng },
-      { lat: targetLat, lng: targetLng }
-    ]
-  }
-
-  const segment = routePoints.slice(startIndex, targetIndex + 1)
-  return [
-    { lat: startLat, lng: startLng },
-    ...segment,
-    { lat: targetLat, lng: targetLng }
-  ]
-}
-
-function computePathSample(path, progress) {
-  if (!path || path.length < 2) {
-    return {
-      lat: path?.[0]?.lat ?? 0,
-      lng: path?.[0]?.lng ?? 0,
-      angle: 0
-    }
-  }
-
-  const clamped = Math.max(0, Math.min(1, progress))
-  const distances = [0]
-  let total = 0
-
-  for (let index = 1; index < path.length; index += 1) {
-    const prev = path[index - 1]
-    const curr = path[index]
-    const segmentLength = Math.sqrt(distanceSquared(prev.lat, prev.lng, curr.lat, curr.lng))
-    total += segmentLength
-    distances.push(total)
-  }
-
-  if (total === 0) {
-    return {
-      lat: path[0].lat,
-      lng: path[0].lng,
-      angle: 0
-    }
-  }
-
-  const target = total * clamped
-  for (let index = 1; index < path.length; index += 1) {
-    const prevDistance = distances[index - 1]
-    const currDistance = distances[index]
-    if (target <= currDistance) {
-      const prev = path[index - 1]
-      const curr = path[index]
-      const localProgress = (target - prevDistance) / Math.max(currDistance - prevDistance, 0.000001)
-      const lat = prev.lat + (curr.lat - prev.lat) * localProgress
-      const lng = prev.lng + (curr.lng - prev.lng) * localProgress
-      const angle = Math.atan2(curr.lng - prev.lng, curr.lat - prev.lat) * 180 / Math.PI
-
-      return { lat, lng, angle }
-    }
-  }
-
-  const prev = path[path.length - 2]
-  const curr = path[path.length - 1]
-  return {
-    lat: curr.lat,
-    lng: curr.lng,
-    angle: Math.atan2(curr.lng - prev.lng, curr.lat - prev.lat) * 180 / Math.PI
-  }
-}
-
-function updateMarkerRotation(marker, angle) {
-  const element = marker.getElement()
-  if (!element) {
+function ensureActiveDirection() {
+  const directions = directionOptions.value
+  if (!directions.length) {
+    activeDirectionId.value = ''
+    expandedStopId.value = ''
     return
   }
 
-  const rotator = element.querySelector('.bus-vehicle-rotator')
-  if (rotator) {
-    rotator.style.transform = `rotate(${angle}deg)`
+  const stillExists = directions.some((item) => item.id === activeDirectionId.value)
+  if (!stillExists) {
+    activeDirectionId.value = directions[0].id
+  }
+
+  if (!activeStops.value.some((stop) => stop.id === expandedStopId.value)) {
+    expandedStopId.value = ''
   }
 }
 
-function resolveRemainingSeconds(vehicle, firstLeg) {
-  const candidates = [
-    vehicle?.timeToStationSeconds,
-    vehicle?.timeToNextStopSeconds,
-    firstLeg?.durationSeconds,
-    firstLeg?.durationMs ? Math.round(firstLeg.durationMs / 1000) : null
-  ]
-
-  for (const candidate of candidates) {
-    const value = Number(candidate)
-    if (Number.isFinite(value) && value > 0) {
-      return value
-    }
+function getPredictionRemainingSeconds(prediction) {
+  const source = Number(prediction?.timeToStationSeconds)
+  if (!Number.isFinite(source)) {
+    return null
   }
 
-  return 60
+  const elapsedSeconds = Math.floor((countdownNow.value - lineMapUpdatedAt.value) / 1000)
+  return Math.max(0, source - elapsedSeconds)
 }
 
-function selectVisibleVehicles(vehicles = []) {
-  return vehicles.filter((vehicle) => vehicle?.vehicleId)
-}
-
-function calculateVirtualStartPoint(routePoints, leg, remainingSeconds) {
-  if (!leg?.from || !leg?.to || !routePoints.length) {
-    const fallback = leg?.from || leg?.to || { lat: 51.5074, lng: -0.1278 }
+function getArrivalPresentation(remainingSeconds) {
+  if (remainingSeconds == null) {
     return {
-      lat: fallback.lat,
-      lng: fallback.lng,
-      holdMs: 0
+      label: '暂无预测',
+      state: 'muted'
     }
   }
 
-  const toIndex = findNearestRouteIndex(leg.to.lat, leg.to.lng, routePoints)
-  if (toIndex < 0) {
+  if (remainingSeconds <= 5) {
     return {
-      lat: leg.from.lat,
-      lng: leg.from.lng,
-      holdMs: 0
+      label: '已到站',
+      state: 'arrived'
     }
   }
 
-  let fromIndex = toIndex
-  let bestDistance = Number.POSITIVE_INFINITY
-  for (let index = toIndex; index >= 0; index -= 1) {
-    const point = routePoints[index]
-    const distance = distanceSquared(leg.from.lat, leg.from.lng, point.lat, point.lng)
-    if (distance < bestDistance) {
-      bestDistance = distance
-      fromIndex = index
-    }
-  }
-
-  if (toIndex <= fromIndex) {
+  if (remainingSeconds <= 30) {
     return {
-      lat: leg.from.lat,
-      lng: leg.from.lng,
-      holdMs: 0
+      label: '即将到站',
+      state: 'soon'
     }
   }
 
-  const segmentDistance = routeDistanceMeters(routePoints, fromIndex, toIndex)
-  const estimatedSpeed = 5
-  const normalizedRemainingSeconds = Math.max(0, Number(remainingSeconds) || 0)
-  let remainingDistance = estimatedSpeed * normalizedRemainingSeconds
-
-  if (remainingDistance >= segmentDistance) {
-    const holdSeconds = (remainingDistance - segmentDistance) / estimatedSpeed
-    const routeStart = routePoints[0] || leg.from
-    return {
-      lat: routeStart.lat,
-      lng: routeStart.lng,
-      holdMs: Math.max(0, holdSeconds * 1000)
-    }
-  }
-
-  for (let index = toIndex; index > fromIndex; index -= 1) {
-    const current = routePoints[index]
-    const previous = routePoints[index - 1]
-    const step = segmentDistanceMeters(previous, current)
-    if (remainingDistance <= step) {
-      const ratio = step <= 0 ? 0 : remainingDistance / step
-      return {
-        lat: current.lat + (previous.lat - current.lat) * ratio,
-        lng: current.lng + (previous.lng - current.lng) * ratio,
-        holdMs: 0
-      }
-    }
-    remainingDistance -= step
-  }
-
-  const routeStart = routePoints[Math.max(0, fromIndex)] || leg.from
   return {
-    lat: routeStart.lat,
-    lng: routeStart.lng,
-    holdMs: 0
+    label: `${Math.ceil(remainingSeconds / 60)} 分钟`,
+    state: 'normal'
   }
 }
 
-function mapVehiclePlan(vehicle, stopLookup) {
-  return (vehicle.travelPlan || [])
-    .map((leg) => {
-      const from = stopLookup.get(leg.fromStopId)
-      const to = stopLookup.get(leg.toStopId)
-      if (!from || !to) {
-        return null
-      }
-      const durationSeconds = resolveRemainingSeconds({}, leg)
-      return {
-        from,
-        to,
-        fromStopId: leg.fromStopId,
-        toStopId: leg.toStopId,
-        durationSeconds,
-        durationMs: durationSeconds * 1000
-      }
-    })
-    .filter(Boolean)
-}
-
-function animateVehicles(timestamp) {
-  let hasActiveAnimation = false
-
-  vehicleMarkers.forEach((entry) => {
-    if (!entry.marker) {
-      return
-    }
-
-    if (!entry.plan.length) {
-      if (entry.waitingPoint) {
-        entry.marker.setLatLng([entry.waitingPoint.lat, entry.waitingPoint.lng])
-      }
-      return
-    }
-
-    if (entry.waitUntil && timestamp < entry.waitUntil) {
-      entry.marker.setLatLng([entry.waitingPoint.lat, entry.waitingPoint.lng])
-      hasActiveAnimation = true
-      return
-    }
-
-    if (entry.waitUntil && timestamp >= entry.waitUntil) {
-      entry.waitUntil = null
-      if (entry.currentLegIndex < entry.plan.length) {
-        const nextLeg = entry.plan[entry.currentLegIndex]
-        entry.path = buildTravelPath(
-          entry.waitingPoint.lat,
-          entry.waitingPoint.lng,
-          nextLeg.to.lat,
-          nextLeg.to.lng,
-          getRoutePoints()
-        )
-        entry.segmentStartTime = timestamp
-        entry.segmentEndTime = timestamp + nextLeg.durationMs
-      }
-    }
-
-    if (entry.currentLegIndex >= entry.plan.length) {
-      if (entry.waitingPoint) {
-        entry.marker.setLatLng([entry.waitingPoint.lat, entry.waitingPoint.lng])
-      }
-      return
-    }
-
-    if (timestamp < entry.segmentStartTime) {
-      if (entry.waitingPoint) {
-        entry.marker.setLatLng([entry.waitingPoint.lat, entry.waitingPoint.lng])
-      }
-      hasActiveAnimation = true
-      return
-    }
-
-    const duration = Math.max(1, entry.segmentEndTime - entry.segmentStartTime)
-    const progress = Math.min(1, Math.max(0, (timestamp - entry.segmentStartTime) / duration))
-    const sample = computePathSample(entry.path, progress)
-    entry.marker.setLatLng([sample.lat, sample.lng])
-    updateMarkerRotation(entry.marker, sample.angle)
-
-    if (progress >= 1) {
-      const completedLeg = entry.plan[entry.currentLegIndex]
-      entry.marker.setLatLng([completedLeg.to.lat, completedLeg.to.lng])
-      entry.waitingPoint = completedLeg.to
-      const nextLeg = entry.plan[entry.currentLegIndex + 1]
-      if (nextLeg) {
-        entry.currentLegIndex += 1
-        entry.waitUntil = timestamp + STATION_HOLD_MS
-      } else {
-        entry.segmentStartTime = timestamp
-        entry.segmentEndTime = timestamp
-        entry.waitUntil = null
-      }
-      hasActiveAnimation = true
-      return
-    }
-
-    if (progress < 1 || entry.currentLegIndex < entry.plan.length) {
-      hasActiveAnimation = true
+function getStopPredictions(stop) {
+  return (stop.arrivals || []).slice(0, 2).map((prediction, index) => {
+    const remainingSeconds = getPredictionRemainingSeconds(prediction)
+    const presentation = getArrivalPresentation(remainingSeconds)
+    return {
+      key: `${stop.id}-${prediction.vehicleId || index}`,
+      vehicleId: prediction.vehicleId,
+      destinationName: prediction.destinationName || activeDirection.value?.destinationName || '终点站',
+      remainingSeconds,
+      label: index === 0 ? '下一辆' : '下下辆',
+      display: presentation.label,
+      state: presentation.state
     }
   })
-
-  if (hasActiveAnimation) {
-    vehicleAnimationFrame = requestAnimationFrame(animateVehicles)
-  } else {
-    vehicleAnimationFrame = null
-  }
 }
 
-function startVehicleAnimationLoop() {
-  if (vehicleAnimationFrame) {
-    cancelAnimationFrame(vehicleAnimationFrame)
+function getReminderForm(directionId, stopId) {
+  const key = `${directionId}:${stopId}`
+  if (!reminderForms.value[key]) {
+    reminderForms.value[key] = {
+      stopsAhead: 1,
+      minutesAhead: 3
+    }
   }
-  vehicleAnimationFrame = requestAnimationFrame(animateVehicles)
+  return reminderForms.value[key]
 }
 
-function updateVehicleMarkers(vehicles = []) {
-  if (!leafletMap.value) {
+function focusStopOnMap(stop) {
+  if (!leafletMap.value || !stop) {
     return
   }
 
-  if (!vehicleLayerGroup.value) {
-    vehicleLayerGroup.value = L.layerGroup().addTo(leafletMap.value)
-  }
-
-  const stopLookup = getStopLookup()
-  const routePoints = getRoutePoints()
-  const visibleVehicles = selectVisibleVehicles(vehicles)
-  const nextIds = new Set(visibleVehicles.map((vehicle) => vehicle.vehicleId))
-
-  vehicleMarkers.forEach((entry, vehicleId) => {
-    if (!nextIds.has(vehicleId)) {
-      vehicleLayerGroup.value.removeLayer(entry.marker)
-      vehicleMarkers.delete(vehicleId)
-    }
+  leafletMap.value.flyTo([stop.lat, stop.lng], Math.max(leafletMap.value.getZoom(), 14), {
+    animate: true,
+    duration: 0.8
   })
 
-  const now = performance.now()
-  visibleVehicles.forEach((vehicle) => {
-    const markerLabel = selectedLine.value?.name || '52'
-    const directionText = vehicle.destinationName || '终点站'
-    const nextStop = stopLookup.get(vehicle.nextStopId)
-    const plan = mapVehiclePlan(vehicle, stopLookup)
-    const remainingSeconds = Number(vehicle.timeToStationSeconds ?? vehicle.timeToNextStopSeconds ?? 60)
-    const currentDurationMs = Math.max(1000, remainingSeconds * 1000)
-    const popupText = `
-      <div class="stop-popup">
-        <strong>${markerLabel}路公交</strong>
-        <div>开往 ${directionText}</div>
-        <div>${vehicle.currentLocation || '车辆行驶中'}</div>
-        <div>下一站：${vehicle.nextStopName || '未知'}</div>
-        <div>${formatArrival({ timeToStationSeconds: vehicle.timeToNextStopSeconds })}</div>
-      </div>
-    `
-
-    const existing = vehicleMarkers.get(vehicle.vehicleId)
-    if (!existing) {
-      const firstLeg = plan[0]
-      const virtualStart = calculateVirtualStartPoint(
-        routePoints,
-        firstLeg || {
-          from: nextStop,
-          to: nextStop,
-          durationSeconds: remainingSeconds
-        },
-        remainingSeconds
-      )
-      const path = buildTravelPath(
-        virtualStart.lat,
-        virtualStart.lng,
-        firstLeg?.to?.lat ?? nextStop?.lat ?? virtualStart.lat,
-        firstLeg?.to?.lng ?? nextStop?.lng ?? virtualStart.lng,
-        routePoints
-      )
-      const marker = L.marker([virtualStart.lat, virtualStart.lng], {
-        icon: createDirectionalVehicleIcon(markerLabel, 0),
-        zIndexOffset: 1000
-      }).bindPopup(popupText)
-
-      vehicleLayerGroup.value.addLayer(marker)
-      const initialSample = computePathSample(path, 0)
-      updateMarkerRotation(marker, initialSample.angle)
-      vehicleMarkers.set(vehicle.vehicleId, {
-        marker,
-        plan,
-        currentLegIndex: 0,
-        path,
-        segmentStartTime: now + virtualStart.holdMs,
-        segmentEndTime: now + currentDurationMs,
-        waitUntil: null,
-        waitingPoint: { lat: virtualStart.lat, lng: virtualStart.lng }
-      })
-      return
-    }
-
-    existing.marker.setIcon(createDirectionalVehicleIcon(markerLabel, 0))
-    existing.marker.setPopupContent(popupText)
-    const currentLeg = existing.plan[existing.currentLegIndex]
-    const newRemainingMs = currentDurationMs
-
-    if (!currentLeg && plan.length > 0) {
-      existing.plan = plan
-      existing.currentLegIndex = 0
-      existing.path = buildTravelPath(
-        existing.waitingPoint?.lat ?? plan[0].from.lat,
-        existing.waitingPoint?.lng ?? plan[0].from.lng,
-        plan[0].to.lat,
-        plan[0].to.lng,
-        routePoints
-      )
-      existing.segmentStartTime = now
-      existing.segmentEndTime = now + newRemainingMs
-      existing.waitUntil = null
-      existing.waitingPoint = plan[0].from
-      return
-    }
-
-    if (currentLeg && plan.length > 0 && currentLeg.toStopId === plan[0].toStopId && existing.currentLegIndex === 0) {
-      const currentDuration = Math.max(1, existing.segmentEndTime - existing.segmentStartTime)
-      const currentProgress = Math.max(0, (now - existing.segmentStartTime) / currentDuration)
-      const remainingProgress = 1 - currentProgress
-
-      existing.plan = [
-        {
-          ...currentLeg,
-          ...plan[0],
-          durationMs: newRemainingMs
-        },
-        ...plan.slice(1)
-      ]
-
-      if (currentProgress < 1 && remainingProgress > 0) {
-        const newTotalDuration = newRemainingMs / remainingProgress
-        existing.segmentEndTime = now + newRemainingMs
-        existing.segmentStartTime = existing.segmentEndTime - newTotalDuration
-      } else if (currentProgress >= 1) {
-        existing.segmentStartTime = now
-        existing.segmentEndTime = now + newRemainingMs
-      }
-      return
-    }
-
-    if (currentLeg && plan.length > 0 && currentLeg.toStopId === plan[0].toStopId) {
-      existing.plan = [
-        {
-          ...existing.plan[existing.currentLegIndex],
-          ...plan[0],
-          durationMs: newRemainingMs
-        },
-        ...plan.slice(1)
-      ]
-      existing.segmentEndTime = now + newRemainingMs
-      return
-    }
-
-    if (plan.length > 0 && (!existing.waitUntil || now >= existing.waitUntil)) {
-      existing.plan = plan
-      existing.currentLegIndex = 0
-      existing.path = buildTravelPath(
-        existing.waitingPoint?.lat ?? plan[0].from.lat,
-        existing.waitingPoint?.lng ?? plan[0].from.lng,
-        plan[0].to.lat,
-        plan[0].to.lng,
-        routePoints
-      )
-      existing.segmentStartTime = now
-      existing.segmentEndTime = now + newRemainingMs
-      existing.waitUntil = null
-      existing.waitingPoint = plan[0].from
-      return
-    }
-  })
-
-  startVehicleAnimationLoop()
-}
-
-function stopVehicleRefresh() {
-  if (vehicleRefreshTimer) {
-    clearInterval(vehicleRefreshTimer)
-    vehicleRefreshTimer = null
-  }
-  if (vehicleAnimationFrame) {
-    cancelAnimationFrame(vehicleAnimationFrame)
-    vehicleAnimationFrame = null
+  const marker = stopMarkerLookup.get(stop.id)
+  if (marker) {
+    marker.openPopup()
   }
 }
 
-function startVehicleRefresh() {
-  stopVehicleRefresh()
-  vehicleRefreshTimer = setInterval(() => {
-    loadSelectedLineMap(true)
-  }, VEHICLE_REFRESH_MS)
+function toggleStop(stop) {
+  expandedStopId.value = expandedStopId.value === stop.id ? '' : stop.id
+  if (expandedStopId.value === stop.id) {
+    focusStopOnMap(stop)
+  }
+}
+
+function selectDirection(directionId) {
+  activeDirectionId.value = directionId
+  expandedStopId.value = ''
+
+  const firstStop = activeDirection.value?.stops?.[0]
+  if (firstStop) {
+    focusStopOnMap(firstStop)
+  }
+}
+
+function pushReminderToast(task, message) {
+  const toast = {
+    id: `${task.id}-${Date.now()}`,
+    title: `${selectedLine.value?.displayName || '公交线路'} 到站提醒`,
+    message
+  }
+  reminderToasts.value = [toast, ...reminderToasts.value].slice(0, 3)
+
+  window.setTimeout(() => {
+    dismissToast(toast.id)
+  }, 5000)
+}
+
+function dismissToast(toastId) {
+  reminderToasts.value = reminderToasts.value.filter((item) => item.id !== toastId)
+}
+
+function enableReminder(stop) {
+  const direction = activeDirection.value
+  if (!direction) {
+    return
+  }
+
+  const form = getReminderForm(direction.id, stop.id)
+  const taskId = `${selectedLine.value?.id || 'line'}:${direction.id}:${stop.id}`
+  const nextPredictions = getStopPredictions(stop)
+
+  reminderTasks.value = reminderTasks.value.filter((item) => item.id !== taskId)
+  reminderTasks.value.push({
+    id: taskId,
+    lineId: selectedLine.value?.id || '',
+    lineName: selectedLine.value?.displayName || '',
+    directionId: direction.id,
+    directionLabel: direction.label,
+    stopId: stop.id,
+    stopName: stop.name,
+    stopsAhead: Number(form.stopsAhead) || 1,
+    minutesAhead: Number(form.minutesAhead) || 3,
+    targetVehicleIds: nextPredictions.map((item) => item.vehicleId).filter(Boolean),
+    triggered: false
+  })
+}
+
+function findReminderStop(directionId, stopId) {
+  const direction = directionOptions.value.find((item) => item.id === directionId)
+  if (!direction) {
+    return null
+  }
+
+  return direction.stops.find((item) => item.id === stopId) || null
+}
+
+function matchesStopsAhead(task, directionStops, targetIndex) {
+  if (task.stopsAhead <= 0) {
+    return false
+  }
+
+  const upstreamStops = directionStops.slice(Math.max(0, targetIndex - task.stopsAhead), targetIndex)
+  if (!upstreamStops.length || !task.targetVehicleIds.length) {
+    return false
+  }
+
+  return upstreamStops.some((stop) =>
+    (stop.arrivals || []).some((prediction) => task.targetVehicleIds.includes(prediction.vehicleId))
+  )
+}
+
+function evaluateReminders() {
+  if (!reminderTasks.value.length) {
+    return
+  }
+
+  reminderTasks.value.forEach((task) => {
+    if (task.triggered || task.lineId !== selectedLine.value?.id) {
+      return
+    }
+
+    const direction = directionOptions.value.find((item) => item.id === task.directionId)
+    if (!direction) {
+      return
+    }
+
+    const stopIndex = direction.stops.findIndex((item) => item.id === task.stopId)
+    if (stopIndex < 0) {
+      return
+    }
+
+    const stop = direction.stops[stopIndex]
+    const predictions = getStopPredictions(stop)
+    const minutesThresholdSeconds = task.minutesAhead * 60
+    const matchedByMinutes = predictions.some((item) => item.remainingSeconds != null && item.remainingSeconds <= minutesThresholdSeconds)
+    const matchedByStops = matchesStopsAhead(task, direction.stops, stopIndex)
+
+    if (!matchedByMinutes && !matchedByStops) {
+      return
+    }
+
+    task.triggered = true
+    const message = matchedByStops
+      ? `${task.stopName} 的车辆已进入前 ${task.stopsAhead} 站范围，请准备下车。`
+      : `${task.stopName} 最近一辆公交将在 ${task.minutesAhead} 分钟内到站。`
+    pushReminderToast(task, message)
+  })
 }
 
 async function fetchSuggestions(query) {
@@ -785,10 +432,39 @@ async function fetchSuggestions(query) {
   }
 }
 
+function stopLiveTimers() {
+  if (lineRefreshTimer) {
+    clearInterval(lineRefreshTimer)
+    lineRefreshTimer = null
+  }
+
+  if (countdownTimer) {
+    clearInterval(countdownTimer)
+    countdownTimer = null
+  }
+}
+
+function startLiveTimers() {
+  stopLiveTimers()
+
+  lineRefreshTimer = setInterval(() => {
+    loadSelectedLineMap(true)
+  }, LINE_REFRESH_MS)
+
+  countdownTimer = setInterval(() => {
+    countdownNow.value = Date.now()
+    evaluateReminders()
+  }, COUNTDOWN_TICK_MS)
+}
+
 async function selectLine(line) {
   selectedLine.value = line
   searchQuery.value = line.displayName
   isSuggestionOpen.value = false
+  isLinePanelOpen.value = true
+  reminderTasks.value = []
+  reminderToasts.value = []
+  expandedStopId.value = ''
 
   if (currentCity.value !== '伦敦') {
     currentCity.value = '伦敦'
@@ -797,7 +473,12 @@ async function selectLine(line) {
 
   await ensureLondonMap()
   await loadSelectedLineMap(false)
-  startVehicleRefresh()
+  startLiveTimers()
+}
+
+function closeLinePanel() {
+  isLinePanelOpen.value = false
+  expandedStopId.value = ''
 }
 
 async function loadSelectedLineMap(refreshOnly = false) {
@@ -810,21 +491,26 @@ async function loadSelectedLineMap(refreshOnly = false) {
     if (!response.ok) {
       return
     }
+
     const lineMap = await response.json()
     currentLineMap.value = lineMap
-    vehicleStatus.value = lineMap.vehicleStatus || ''
-    vehicleMessage.value = lineMap.vehicleMessage || ''
+    lineStatus.value = lineMap.vehicleStatus || ''
+    lineStatusMessage.value = lineMap.vehicleMessage || ''
+    lineMapUpdatedAt.value = Date.now()
+    countdownNow.value = lineMapUpdatedAt.value
+    ensureActiveDirection()
+
     if (!refreshOnly) {
       renderLineOnMap(lineMap, true)
     }
-    updateVehicleMarkers(Array.isArray(lineMap.vehicles) ? lineMap.vehicles : [])
+
+    evaluateReminders()
   } catch {
     if (!refreshOnly) {
       clearRouteLayer()
     }
-    clearVehicleLayer()
-    vehicleStatus.value = 'error'
-    vehicleMessage.value = '请求车辆位置失败，请检查后端或 TfL 接口连通性'
+    lineStatus.value = 'error'
+    lineStatusMessage.value = '请求线路与到站信息失败，请检查后端或 TfL 接口连通性'
   }
 }
 
@@ -835,19 +521,23 @@ watch(
       await ensureLondonMap()
       if (selectedLine.value?.id) {
         await loadSelectedLineMap(false)
-        startVehicleRefresh()
+        startLiveTimers()
       }
       return
     }
 
-    stopVehicleRefresh()
-    clearVehicleLayer()
+    stopLiveTimers()
+    clearRouteLayer()
     if (leafletMap.value) {
       leafletMap.value.invalidateSize()
     }
   },
   { immediate: true }
 )
+
+watch(directionOptions, () => {
+  ensureActiveDirection()
+})
 
 watch(searchQuery, (query) => {
   if (searchTimer.value) {
@@ -869,8 +559,8 @@ onBeforeUnmount(() => {
   if (searchTimer.value) {
     clearTimeout(searchTimer.value)
   }
-  stopVehicleRefresh()
-  clearVehicleLayer()
+  stopLiveTimers()
+  clearRouteLayer()
   if (leafletMap.value) {
     leafletMap.value.remove()
     leafletMap.value = null
@@ -946,34 +636,6 @@ onBeforeUnmount(() => {
           <span>{{ item.name }}</span>
         </button>
       </nav>
-
-      <section class="route-planner">
-        <div class="route-inputs">
-          <label class="route-field">
-            <span class="sr-only">起点</span>
-            <input v-model="routeStart" type="text" placeholder="起点" />
-          </label>
-
-          <label class="route-field">
-            <span class="sr-only">终点</span>
-            <input v-model="routeEnd" type="text" placeholder="终点" />
-          </label>
-
-          <button
-            class="swap-button"
-            type="button"
-            aria-label="互换起点和终点"
-            @click="swapRoutePoints"
-          >
-            <span class="swap-icon"></span>
-          </button>
-        </div>
-
-        <div class="route-actions">
-          <button class="route-time" type="button">现在出发</button>
-          <button class="route-go" type="button">查询</button>
-        </div>
-      </section>
     </aside>
 
     <main class="floating-panel">
@@ -1010,14 +672,132 @@ onBeforeUnmount(() => {
         </button>
       </div>
 
-      <div
-        v-if="selectedLine?.id === '52' && currentCity === '伦敦'"
-        class="vehicle-status-card"
-        :class="vehicleStatus"
-      >
-        <strong>52路车辆状态</strong>
-        <span>{{ vehicleMessage }}</span>
+      <div v-if="selectedLine" class="line-status-card" :class="lineStatus">
+        <div>
+          <strong>{{ selectedLine.displayName }}</strong>
+          <span>{{ lineStatusMessage || '已切换为站点到站信息视图' }}</span>
+        </div>
+        <small>提醒任务 {{ reminderTaskCount }} 个</small>
       </div>
     </main>
+
+    <aside v-if="selectedLine && isLinePanelOpen" class="line-sidepanel">
+      <template v-if="activeDirection">
+        <header class="line-panel-header">
+          <div>
+            <small>{{ selectedLine.city }} · {{ selectedLine.mode }}</small>
+            <h2>{{ selectedLine.displayName }}</h2>
+          </div>
+          <div class="line-panel-header-actions">
+            <span class="line-panel-chip">{{ activeStops.length }} 站</span>
+            <button type="button" class="line-panel-close" @click="closeLinePanel">×</button>
+          </div>
+        </header>
+
+        <div class="direction-tabs">
+          <button
+            v-for="(direction, index) in directionOptions"
+            :key="direction.id"
+            type="button"
+            class="direction-tab"
+            :class="{ active: direction.id === activeDirectionId }"
+            @click="selectDirection(direction.id)"
+          >
+            <span class="direction-tab-index">{{ getDirectionBadge(index) }}</span>
+            <span>{{ direction.label }}</span>
+          </button>
+        </div>
+
+        <div class="stop-list">
+          <article
+            v-for="(stop, index) in activeStops"
+            :key="`${activeDirectionId}-${stop.id}-${index}`"
+            class="stop-card"
+            :class="{ expanded: expandedStopId === stop.id }"
+          >
+            <button class="stop-card-head" type="button" @click="toggleStop(stop)">
+              <div class="stop-seq">
+                <span class="stop-seq-dot"></span>
+                <span class="stop-seq-index">{{ getDirectionBadge(index) }}</span>
+              </div>
+
+              <div class="stop-card-copy">
+                <strong>{{ stop.name }}</strong>
+                <span>{{ activeDirection.label }}</span>
+              </div>
+
+              <span class="stop-card-toggle">{{ expandedStopId === stop.id ? '收起' : '展开' }}</span>
+            </button>
+
+            <div v-if="expandedStopId === stop.id" class="stop-card-body">
+              <div class="arrival-list">
+                <div
+                  v-for="item in getStopPredictions(stop)"
+                  :key="item.key"
+                  class="arrival-item"
+                  :class="item.state"
+                >
+                  <div>
+                    <small>{{ item.label }}</small>
+                    <strong>{{ item.destinationName }}</strong>
+                  </div>
+                  <span class="arrival-time">{{ item.display }}</span>
+                </div>
+
+                <div v-if="getStopPredictions(stop).length === 0" class="arrival-empty">
+                  当前暂无这座站点的到站预测数据
+                </div>
+              </div>
+
+              <div class="reminder-box">
+                <div class="reminder-box-header">
+                  <strong>到站提醒</strong>
+                  <span>页面内提示，不调用浏览器原生通知</span>
+                </div>
+
+                <div class="reminder-form">
+                  <label class="reminder-field">
+                    <span>提前站数</span>
+                    <select v-model.number="getReminderForm(activeDirectionId, stop.id).stopsAhead">
+                      <option :value="1">提前 1 站</option>
+                      <option :value="2">提前 2 站</option>
+                      <option :value="3">提前 3 站</option>
+                    </select>
+                  </label>
+
+                  <label class="reminder-field">
+                    <span>提前时间</span>
+                    <select v-model.number="getReminderForm(activeDirectionId, stop.id).minutesAhead">
+                      <option :value="1">1 分钟</option>
+                      <option :value="3">3 分钟</option>
+                      <option :value="5">5 分钟</option>
+                    </select>
+                  </label>
+                </div>
+
+                <button class="reminder-action" type="button" @click="enableReminder(stop)">
+                  开启提醒
+                </button>
+              </div>
+            </div>
+          </article>
+        </div>
+      </template>
+
+      <div v-else class="line-panel-empty">
+        <strong>选择一条公交线路</strong>
+        <p>搜索并选中线路后，这里会显示两个方向的站点序列与实时到站信息。</p>
+      </div>
+    </aside>
+
+    <div v-if="reminderToasts.length" class="toast-stack">
+      <div v-for="toast in reminderToasts" :key="toast.id" class="toast-card">
+        <div>
+          <strong>{{ toast.title }}</strong>
+          <p>{{ toast.message }}</p>
+        </div>
+        <button type="button" class="toast-close" @click="dismissToast(toast.id)">知道了</button>
+      </div>
+    </div>
   </div>
 </template>

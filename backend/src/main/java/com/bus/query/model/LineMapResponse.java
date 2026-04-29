@@ -9,6 +9,7 @@ public record LineMapResponse(
         String city,
         List<LatLngDto> routePath,
         List<StopMarkerDto> stops,
+        List<LineDirectionDto> directions,
         List<VehiclePositionDto> vehicles,
         String vehicleStatus,
         String vehicleMessage
