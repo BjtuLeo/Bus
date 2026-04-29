@@ -13,6 +13,7 @@ const cityItems = [
 ]
 
 const searchQuery = ref('')
+const currentLineId = ref('')
 const lineSuggestions = ref([])
 const isSuggestionOpen = ref(false)
 const selectedLine = ref(null)
@@ -71,7 +72,7 @@ const directionOptions = computed(() => {
   return [
     {
       id: 'default',
-      label: '全线站点',
+      label: formatDirectionLabel(fallbackStops.at(-1)?.name || '终点站'),
       destinationName: fallbackStops.at(-1)?.name || '终点站',
       stops: fallbackStops
     }
@@ -92,11 +93,55 @@ const activeStops = computed(() => activeDirection.value?.stops || [])
 const expandedStop = computed(() => activeStops.value.find((stop) => stop.id === expandedStopId.value) || null)
 
 const reminderTaskCount = computed(() => reminderTasks.value.length)
+const activeLineColor = computed(() => getLineColor(currentLineId.value || selectedLine.value?.id || '52'))
 
 function selectSidebarItem(item) {
   if (item.type === 'city') {
     currentCity.value = item.name
   }
+}
+
+function normalizeLineId(value) {
+  return String(value || '').trim().toUpperCase()
+}
+
+function extractLineId(value) {
+  const raw = normalizeLineId(value)
+  if (!raw) {
+    return ''
+  }
+
+  const matched = raw.match(/[A-Z]*\d+[A-Z]*/i)
+  return matched ? normalizeLineId(matched[0]) : raw.replace(/\s+/g, '')
+}
+
+function buildLineItem(lineId) {
+  const normalized = normalizeLineId(lineId)
+  return {
+    id: normalized,
+    name: normalized,
+    displayName: `${normalized}路公交`,
+    city: '伦敦',
+    mode: 'bus'
+  }
+}
+
+function getLineColor(lineId) {
+  const palette = ['#d92d27', '#1769ff', '#0f9d58', '#8e24aa', '#ff6d00', '#00838f', '#c2185b', '#5d4037']
+  const normalized = normalizeLineId(lineId)
+  if (!normalized) {
+    return '#d92d27'
+  }
+
+  let hash = 0
+  for (const char of normalized) {
+    hash = (hash * 31 + char.charCodeAt(0)) >>> 0
+  }
+  return palette[hash % palette.length]
+}
+
+function formatDirectionLabel(destinationName) {
+  return `开往: ${destinationName || '终点站'}`
 }
 
 async function ensureLondonMap() {
@@ -156,7 +201,7 @@ function renderLineOnMap(lineMap, shouldFit = true) {
   const routePath = (lineMap.routePath || []).map((point) => [point.lat, point.lng])
   if (routePath.length > 1) {
     const routeLine = L.polyline(routePath, {
-      color: '#d92d27',
+      color: activeLineColor.value,
       weight: 6,
       opacity: 0.96,
       lineJoin: 'round'
@@ -168,7 +213,7 @@ function renderLineOnMap(lineMap, shouldFit = true) {
   ;(lineMap.stops || []).forEach((stop) => {
     const marker = L.circleMarker([stop.lat, stop.lng], {
       radius: 5,
-      color: '#d92d27',
+      color: activeLineColor.value,
       weight: 3,
       fillColor: '#ffffff',
       fillOpacity: 1
@@ -256,7 +301,7 @@ function getStopPredictions(stop) {
     return {
       key: `${stop.id}-${prediction.vehicleId || index}`,
       vehicleId: prediction.vehicleId,
-      destinationName: prediction.destinationName || activeDirection.value?.destinationName || '终点站',
+      destinationName: formatDirectionLabel(prediction.destinationName || activeDirection.value?.destinationName || '终点站'),
       remainingSeconds,
       label: index === 0 ? '下一辆' : '下下辆',
       display: presentation.label,
@@ -337,7 +382,7 @@ function enableReminder(stop) {
   const nextPredictions = getStopPredictions(stop)
 
   reminderTasks.value = reminderTasks.value.filter((item) => item.id !== taskId)
-  reminderTasks.value.push({
+  const task = {
     id: taskId,
     lineId: selectedLine.value?.id || '',
     lineName: selectedLine.value?.displayName || '',
@@ -349,7 +394,28 @@ function enableReminder(stop) {
     minutesAhead: Number(form.minutesAhead) || 3,
     targetVehicleIds: nextPredictions.map((item) => item.vehicleId).filter(Boolean),
     triggered: false
-  })
+  }
+  reminderTasks.value.push(task)
+
+  pushReminderToast(
+    task,
+    `${stop.name} 的到站提醒已开启，将在提前 ${task.stopsAhead} 站或提前 ${task.minutesAhead} 分钟时提示。`
+  )
+}
+
+function resetLineState() {
+  stopLiveTimers()
+  clearRouteLayer()
+  currentLineMap.value = null
+  lineStatus.value = ''
+  lineStatusMessage.value = ''
+  activeDirectionId.value = ''
+  expandedStopId.value = ''
+  reminderTasks.value = []
+  reminderToasts.value = []
+  reminderForms.value = {}
+  lineMapUpdatedAt.value = Date.now()
+  countdownNow.value = Date.now()
 }
 
 function findReminderStop(directionId, stopId) {
@@ -367,13 +433,17 @@ function matchesStopsAhead(task, directionStops, targetIndex) {
   }
 
   const upstreamStops = directionStops.slice(Math.max(0, targetIndex - task.stopsAhead), targetIndex)
-  if (!upstreamStops.length || !task.targetVehicleIds.length) {
+  if (!upstreamStops.length) {
     return false
   }
 
-  return upstreamStops.some((stop) =>
-    (stop.arrivals || []).some((prediction) => task.targetVehicleIds.includes(prediction.vehicleId))
-  )
+  if (task.targetVehicleIds.length) {
+    return upstreamStops.some((stop) =>
+      (stop.arrivals || []).some((prediction) => task.targetVehicleIds.includes(prediction.vehicleId))
+    )
+  }
+
+  return upstreamStops.some((stop) => (stop.arrivals || []).length > 0)
 }
 
 function evaluateReminders() {
@@ -458,22 +528,16 @@ function startLiveTimers() {
 }
 
 async function selectLine(line) {
-  selectedLine.value = line
-  searchQuery.value = line.displayName
+  const normalizedLineId = normalizeLineId(line.id)
+  selectedLine.value = {
+    ...line,
+    id: normalizedLineId,
+    displayName: line.displayName || `${normalizedLineId}路公交`
+  }
+  searchQuery.value = normalizedLineId
   isSuggestionOpen.value = false
   isLinePanelOpen.value = true
-  reminderTasks.value = []
-  reminderToasts.value = []
-  expandedStopId.value = ''
-
-  if (currentCity.value !== '伦敦') {
-    currentCity.value = '伦敦'
-    return
-  }
-
-  await ensureLondonMap()
-  await loadSelectedLineMap(false)
-  startLiveTimers()
+  currentLineId.value = normalizedLineId
 }
 
 function closeLinePanel() {
@@ -481,18 +545,38 @@ function closeLinePanel() {
   expandedStopId.value = ''
 }
 
+async function submitLineSearch() {
+  const lineId = extractLineId(searchQuery.value)
+  if (!lineId) {
+    return
+  }
+
+  isSuggestionOpen.value = false
+  isLinePanelOpen.value = true
+  selectedLine.value = buildLineItem(lineId)
+  searchQuery.value = lineId
+  currentLineId.value = lineId
+}
+
 async function loadSelectedLineMap(refreshOnly = false) {
-  if (!selectedLine.value?.id) {
+  if (!currentLineId.value) {
     return
   }
 
   try {
-    const response = await fetch(`/api/lines/${selectedLine.value.id}/map`)
+    const response = await fetch(`/api/lines/${encodeURIComponent(currentLineId.value)}/map`)
     if (!response.ok) {
       return
     }
 
     const lineMap = await response.json()
+    selectedLine.value = {
+      id: normalizeLineId(lineMap.id || currentLineId.value),
+      name: lineMap.name || currentLineId.value,
+      displayName: lineMap.displayName || `${currentLineId.value}路公交`,
+      city: lineMap.city || '伦敦',
+      mode: 'bus'
+    }
     currentLineMap.value = lineMap
     lineStatus.value = lineMap.vehicleStatus || ''
     lineStatusMessage.value = lineMap.vehicleMessage || ''
@@ -519,7 +603,7 @@ watch(
   async (city) => {
     if (city === '伦敦') {
       await ensureLondonMap()
-      if (selectedLine.value?.id) {
+      if (currentLineId.value) {
         await loadSelectedLineMap(false)
         startLiveTimers()
       }
@@ -534,6 +618,33 @@ watch(
   },
   { immediate: true }
 )
+
+watch(currentLineId, async (newLineId, oldLineId) => {
+  const normalizedNew = normalizeLineId(newLineId)
+  const normalizedOld = normalizeLineId(oldLineId)
+  if (normalizedNew === normalizedOld) {
+    return
+  }
+
+  resetLineState()
+
+  if (!normalizedNew) {
+    selectedLine.value = null
+    isLinePanelOpen.value = false
+    return
+  }
+
+  selectedLine.value = buildLineItem(normalizedNew)
+
+  if (currentCity.value !== '伦敦') {
+    currentCity.value = '伦敦'
+    return
+  }
+
+  await ensureLondonMap()
+  await loadSelectedLineMap(false)
+  startLiveTimers()
+})
 
 watch(directionOptions, () => {
   ensureActiveDirection()
@@ -647,6 +758,7 @@ onBeforeUnmount(() => {
               v-model="searchQuery"
               type="text"
               placeholder="输入公交线路、站点或目的地"
+              @keydown.enter.prevent="submitLineSearch"
               @focus="isSuggestionOpen = lineSuggestions.length > 0"
               @blur="setTimeout(() => { isSuggestionOpen = false }, 150)"
             />
@@ -666,9 +778,9 @@ onBeforeUnmount(() => {
           </div>
         </div>
 
-        <button class="primary-button" type="button">
+        <button class="primary-button" type="button" @click="submitLineSearch">
           <span class="icon-bell small"></span>
-          设置提醒
+          搜索线路
         </button>
       </div>
 
@@ -704,7 +816,7 @@ onBeforeUnmount(() => {
             @click="selectDirection(direction.id)"
           >
             <span class="direction-tab-index">{{ getDirectionBadge(index) }}</span>
-            <span>{{ direction.label }}</span>
+            <span>{{ formatDirectionLabel(direction.destinationName || direction.label) }}</span>
           </button>
         </div>
 
@@ -717,13 +829,13 @@ onBeforeUnmount(() => {
           >
             <button class="stop-card-head" type="button" @click="toggleStop(stop)">
               <div class="stop-seq">
-                <span class="stop-seq-dot"></span>
+                <span class="stop-seq-dot" :style="{ background: activeLineColor, boxShadow: `0 0 14px ${activeLineColor}66` }"></span>
                 <span class="stop-seq-index">{{ getDirectionBadge(index) }}</span>
               </div>
 
               <div class="stop-card-copy">
                 <strong>{{ stop.name }}</strong>
-                <span>{{ activeDirection.label }}</span>
+                <span>{{ formatDirectionLabel(activeDirection.destinationName) }}</span>
               </div>
 
               <span class="stop-card-toggle">{{ expandedStopId === stop.id ? '收起' : '展开' }}</span>

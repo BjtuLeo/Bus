@@ -33,9 +33,7 @@ import org.springframework.web.util.UriComponentsBuilder;
 @Service
 public class TflLineService {
 
-    private static final String SUPPORTED_LINE_ID = "52";
     private static final Pattern NUMBER_PATTERN = Pattern.compile("-?\\d+(?:\\.\\d+)?");
-    private static final LineSearchItem LINE_52 = new LineSearchItem("52", "52", "52路公交", "伦敦", "bus");
 
     private final RestClient restClient;
     private final TflProperties tflProperties;
@@ -58,26 +56,23 @@ public class TflLineService {
             return List.of();
         }
 
-        String normalized = normalize(query);
-        List<String> keywords = List.of("52", "52路", "52路公交", "公交52", "伦敦52", "line52", "bus52");
-        boolean matched = keywords.stream()
-                .map(this::normalize)
-                .anyMatch(keyword -> keyword.contains(normalized) || normalized.contains(keyword));
-
-        if (!matched) {
+        String lineId = extractLineId(query);
+        if (!StringUtils.hasText(lineId)) {
             return List.of();
         }
 
-        return List.of(LINE_52);
+        return List.of(buildLineSearchItem(lineId));
     }
 
     public LineMapResponse getLineMap(String lineId) {
-        if (!SUPPORTED_LINE_ID.equals(lineId)) {
-            throw new ResponseStatusException(HttpStatus.NOT_FOUND, "当前仅实现 52 路公交");
+        String normalizedLineId = extractLineId(lineId);
+        if (!StringUtils.hasText(normalizedLineId)) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "线路号不能为空");
         }
 
-        JsonNode routeSequence = getJson(uriBuilder("/Line/{id}/Route/Sequence/all").build(lineId));
-        JsonNode arrivals = getJson(uriBuilder("/Line/{id}/Arrivals").build(lineId));
+        JsonNode routeSequence = getJson(uriBuilder("/Line/{id}/Route/Sequence/all").build(normalizedLineId));
+        JsonNode arrivals = getJson(uriBuilder("/Line/{id}/Arrivals").build(normalizedLineId));
+        LineSearchItem lineItem = buildLineSearchItem(normalizedLineId);
 
         LinkedHashMap<String, StopMarkerDto> stops = extractStops(routeSequence);
         Map<String, List<ArrivalPredictionDto>> arrivalMap = extractArrivals(arrivals);
@@ -117,10 +112,10 @@ public class TflLineService {
         }
 
         return new LineMapResponse(
-                LINE_52.id(),
-                LINE_52.name(),
-                LINE_52.displayName(),
-                LINE_52.city(),
+                lineItem.id(),
+                lineItem.name(),
+                lineItem.displayName(),
+                lineItem.city(),
                 routePath,
                 new ArrayList<>(mergedStops.values()),
                 directions,
@@ -176,7 +171,7 @@ public class TflLineService {
             }
 
             for (JsonNode stopNode : sequenceStops) {
-                String id = textValue(stopNode, "id");
+                String id = resolveStopId(stopNode);
                 if (!StringUtils.hasText(id) || stops.containsKey(id)) {
                     continue;
                 }
@@ -222,7 +217,7 @@ public class TflLineService {
 
             List<StopMarkerDto> orderedStops = new ArrayList<>();
             for (JsonNode stopNode : sequenceStops) {
-                String id = textValue(stopNode, "id");
+                String id = resolveStopId(stopNode);
                 if (!StringUtils.hasText(id)) {
                     continue;
                 }
@@ -690,5 +685,36 @@ public class TflLineService {
             }
         }
         return "";
+    }
+
+    private String resolveStopId(JsonNode stopNode) {
+        return firstNonBlank(
+                textValue(stopNode, "naptanId"),
+                textValue(stopNode, "id")
+        );
+    }
+
+    private LineSearchItem buildLineSearchItem(String lineId) {
+        String normalized = extractLineId(lineId);
+        return new LineSearchItem(
+                normalized,
+                normalized,
+                normalized + "路公交",
+                "伦敦",
+                "bus"
+        );
+    }
+
+    private String extractLineId(String raw) {
+        if (!StringUtils.hasText(raw)) {
+            return "";
+        }
+
+        String trimmed = raw.trim().toUpperCase(Locale.ROOT);
+        Matcher matcher = Pattern.compile("[A-Z]*\\d+[A-Z]*").matcher(trimmed);
+        if (matcher.find()) {
+            return matcher.group();
+        }
+        return trimmed.replaceAll("\\s+", "");
     }
 }
