@@ -7,7 +7,9 @@
 /Users/fan/Desktop/作业/交通检测与物联网/实时公交系统/backend/src/main/java/com/bus/query/model/LineDirectionDto.java
 /Users/fan/Desktop/作业/交通检测与物联网/实时公交系统/backend/src/main/java/com/bus/query/model/LineMapResponse.java
 /Users/fan/Desktop/作业/交通检测与物联网/实时公交系统/backend/src/main/java/com/bus/query/model/LineSearchItem.java
+/Users/fan/Desktop/作业/交通检测与物联网/实时公交系统/backend/src/main/java/com/bus/query/model/LineTimetableResponse.java
 /Users/fan/Desktop/作业/交通检测与物联网/实时公交系统/backend/src/main/java/com/bus/query/model/StopMarkerDto.java
+/Users/fan/Desktop/作业/交通检测与物联网/实时公交系统/backend/src/main/java/com/bus/query/model/TimetableSectionDto.java
 /Users/fan/Desktop/作业/交通检测与物联网/实时公交系统/backend/src/main/java/com/bus/query/model/VehicleLegDto.java
 /Users/fan/Desktop/作业/交通检测与物联网/实时公交系统/backend/src/main/java/com/bus/query/model/VehiclePositionDto.java
 /Users/fan/Desktop/作业/交通检测与物联网/实时公交系统/backend/src/main/java/com/bus/query/service/TflLineService.java

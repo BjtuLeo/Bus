@@ -1,12 +1,10 @@
 <script setup>
 import L from 'leaflet'
-import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
-const navItems = ['线路总览', '实时地图', '到站提醒']
+const navItems = ['线路总览']
 
-const currentCity = ref('北京')
 const cityItems = [
-  { name: '北京', type: 'city' },
   { name: '伦敦', type: 'city' },
   { name: '收藏线路', type: 'menu' },
   { name: '提醒中心', type: 'menu' }
@@ -35,7 +33,12 @@ const expandedStopId = ref('')
 const reminderForms = ref({})
 const reminderTasks = ref([])
 const reminderToasts = ref([])
+const reminderHistory = ref([])
 const isLinePanelOpen = ref(false)
+const panelMode = ref('line')
+const favoriteLines = ref([])
+
+const FAVORITES_STORAGE_KEY = 'bus-query-favorite-lines'
 
 const LINE_REFRESH_MS = 25000
 const COUNTDOWN_TICK_MS = 1000
@@ -44,19 +47,10 @@ let lineRefreshTimer = null
 let countdownTimer = null
 const stopMarkerLookup = new Map()
 
-const currentMapMeta = computed(() => {
-  if (currentCity.value === '伦敦') {
-    return {
-      badge: '伦敦实时地图',
-      copy: '地图展示当前选中线路的静态轨迹与站点，实时到站信息在右侧站点面板中查看。'
-    }
-  }
-
-  return {
-    badge: '北京地图接口预留区域',
-    copy: '当前为北京地图占位视图，后续可接入北京实时公交线路、站点与到站提醒数据。'
-  }
-})
+const currentMapMeta = computed(() => ({
+  badge: '伦敦实时地图',
+  copy: '地图展示当前选中线路的静态轨迹与站点，实时到站信息在右侧站点面板中查看。'
+}))
 
 const directionOptions = computed(() => {
   const directions = currentLineMap.value?.directions
@@ -95,11 +89,44 @@ const expandedStop = computed(() => activeStops.value.find((stop) => stop.id ===
 const reminderTaskCount = computed(() => reminderTasks.value.length)
 const activeLineColor = computed(() => getLineColor(currentLineId.value || selectedLine.value?.id || '52'))
 const stationPredictionMap = computed(() => buildStationPredictionMap(activeStops.value))
+const isCurrentLineFavorite = computed(() =>
+  favoriteLines.value.some((item) => item.id === selectedLine.value?.id)
+)
+const successToasts = computed(() => reminderToasts.value.filter((item) => item.position === 'top-right'))
+const alertToasts = computed(() => reminderToasts.value.filter((item) => item.position !== 'top-right'))
 
 function selectSidebarItem(item) {
   if (item.type === 'city') {
-    currentCity.value = item.name
+    ensureLondonMap()
+    return
   }
+
+  if (item.name === '收藏线路') {
+    panelMode.value = 'favorites'
+    isLinePanelOpen.value = true
+    return
+  }
+
+  if (item.name === '提醒中心') {
+    panelMode.value = 'reminders'
+    isLinePanelOpen.value = true
+  }
+}
+
+function getSidebarIconClass(item) {
+  if (item.name === '收藏线路') {
+    return 'city-icon-star'
+  }
+
+  if (item.name === '提醒中心') {
+    return 'city-icon-bell'
+  }
+
+  if (item.name === '伦敦') {
+    return 'city-icon-london'
+  }
+
+  return 'city-icon-city'
 }
 
 function normalizeLineId(value) {
@@ -143,6 +170,19 @@ function getLineColor(lineId) {
 
 function formatDirectionLabel(destinationName) {
   return `开往: ${destinationName || '终点站'}`
+}
+
+function loadFavorites() {
+  try {
+    const raw = window.localStorage.getItem(FAVORITES_STORAGE_KEY)
+    favoriteLines.value = raw ? JSON.parse(raw) : []
+  } catch {
+    favoriteLines.value = []
+  }
+}
+
+function saveFavorites() {
+  window.localStorage.setItem(FAVORITES_STORAGE_KEY, JSON.stringify(favoriteLines.value))
 }
 
 async function ensureLondonMap() {
@@ -338,6 +378,7 @@ function getReminderForm(directionId, stopId) {
   const key = `${directionId}:${stopId}`
   if (!reminderForms.value[key]) {
     reminderForms.value[key] = {
+      mode: 'stops',
       stopsAhead: 1,
       minutesAhead: 3
     }
@@ -378,13 +419,27 @@ function selectDirection(directionId) {
   }
 }
 
-function pushReminderToast(task, message) {
+function pushReminderToast(task, message, options = {}) {
   const toast = {
     id: `${task.id}-${Date.now()}`,
     title: `${selectedLine.value?.displayName || '公交线路'} 到站提醒`,
-    message
+    message,
+    tone: options.tone || 'alert',
+    position: options.position || 'bottom-right'
   }
   reminderToasts.value = [toast, ...reminderToasts.value].slice(0, 3)
+
+  if (options.recordHistory) {
+    reminderHistory.value = [
+      {
+        id: toast.id,
+        title: toast.title,
+        message,
+        createdAt: Date.now()
+      },
+      ...reminderHistory.value
+    ].slice(0, 20)
+  }
 
   window.setTimeout(() => {
     dismissToast(toast.id)
@@ -393,6 +448,38 @@ function pushReminderToast(task, message) {
 
 function dismissToast(toastId) {
   reminderToasts.value = reminderToasts.value.filter((item) => item.id !== toastId)
+}
+
+function toggleFavoriteLine() {
+  if (!selectedLine.value?.id) {
+    return
+  }
+
+  const exists = favoriteLines.value.some((item) => item.id === selectedLine.value.id)
+  if (exists) {
+    favoriteLines.value = favoriteLines.value.filter((item) => item.id !== selectedLine.value.id)
+    saveFavorites()
+    pushReminderToast(
+      { id: `favorite-remove-${selectedLine.value.id}` },
+      `${selectedLine.value.displayName} 已取消收藏。`
+    )
+    return
+  }
+
+  favoriteLines.value = [
+    {
+      id: selectedLine.value.id,
+      displayName: selectedLine.value.displayName,
+      city: selectedLine.value.city,
+      mode: selectedLine.value.mode
+    },
+    ...favoriteLines.value
+  ]
+  saveFavorites()
+  pushReminderToast(
+    { id: `favorite-add-${selectedLine.value.id}` },
+    `${selectedLine.value.displayName} 已成功收藏。`
+  )
 }
 
 function enableReminder(stop) {
@@ -414,6 +501,7 @@ function enableReminder(stop) {
     directionLabel: direction.label,
     stopId: stop.id,
     stopName: stop.name,
+    mode: form.mode || 'stops',
     stopsAhead: Number(form.stopsAhead) || 1,
     minutesAhead: Number(form.minutesAhead) || 3,
     targetVehicleIds: nextPredictions.map((item) => item.vehicleId).filter(Boolean),
@@ -423,7 +511,10 @@ function enableReminder(stop) {
 
   pushReminderToast(
     task,
-    `${stop.name} 的到站提醒已开启，将在提前 ${task.stopsAhead} 站或提前 ${task.minutesAhead} 分钟时提示。`
+    task.mode === 'stops'
+      ? `${stop.name} 的到站提醒已开启，将在提前 ${task.stopsAhead} 站时提示。`
+      : `${stop.name} 的到站提醒已开启，将在提前 ${task.minutesAhead} 分钟时提示。`,
+    { recordHistory: false, tone: 'success', position: 'top-right' }
   )
 }
 
@@ -435,8 +526,6 @@ function resetLineState() {
   lineStatusMessage.value = ''
   activeDirectionId.value = ''
   expandedStopId.value = ''
-  reminderTasks.value = []
-  reminderToasts.value = []
   reminderForms.value = {}
   lineMapUpdatedAt.value = Date.now()
   countdownNow.value = Date.now()
@@ -495,16 +584,17 @@ function evaluateReminders() {
     const minutesThresholdSeconds = task.minutesAhead * 60
     const matchedByMinutes = predictions.some((item) => item.remainingSeconds != null && item.remainingSeconds <= minutesThresholdSeconds)
     const matchedByStops = matchesStopsAhead(task, direction.stops, stopIndex)
+    const matched = task.mode === 'minutes' ? matchedByMinutes : matchedByStops
 
-    if (!matchedByMinutes && !matchedByStops) {
+    if (!matched) {
       return
     }
 
     task.triggered = true
-    const message = matchedByStops
+    const message = task.mode === 'stops'
       ? `${task.stopName} 的车辆已进入前 ${task.stopsAhead} 站范围，请准备下车。`
       : `${task.stopName} 最近一辆公交将在 ${task.minutesAhead} 分钟内到站。`
-    pushReminderToast(task, message)
+    pushReminderToast(task, message, { recordHistory: true })
   })
 }
 
@@ -561,12 +651,24 @@ async function selectLine(line) {
   searchQuery.value = normalizedLineId
   isSuggestionOpen.value = false
   isLinePanelOpen.value = true
+  panelMode.value = 'line'
   currentLineId.value = normalizedLineId
 }
 
 function closeLinePanel() {
   isLinePanelOpen.value = false
   expandedStopId.value = ''
+}
+
+function openFavoriteLine(line) {
+  selectLine({
+    ...buildLineItem(line.id),
+    displayName: line.displayName || `${line.id}路公交`
+  })
+}
+
+function removeReminderTask(taskId) {
+  reminderTasks.value = reminderTasks.value.filter((item) => item.id !== taskId)
 }
 
 async function submitLineSearch() {
@@ -577,6 +679,7 @@ async function submitLineSearch() {
 
   isSuggestionOpen.value = false
   isLinePanelOpen.value = true
+  panelMode.value = 'line'
   selectedLine.value = buildLineItem(lineId)
   searchQuery.value = lineId
   currentLineId.value = lineId
@@ -622,27 +725,6 @@ async function loadSelectedLineMap(refreshOnly = false) {
   }
 }
 
-watch(
-  currentCity,
-  async (city) => {
-    if (city === '伦敦') {
-      await ensureLondonMap()
-      if (currentLineId.value) {
-        await loadSelectedLineMap(false)
-        startLiveTimers()
-      }
-      return
-    }
-
-    stopLiveTimers()
-    clearRouteLayer()
-    if (leafletMap.value) {
-      leafletMap.value.invalidateSize()
-    }
-  },
-  { immediate: true }
-)
-
 watch(currentLineId, async (newLineId, oldLineId) => {
   const normalizedNew = normalizeLineId(newLineId)
   const normalizedOld = normalizeLineId(oldLineId)
@@ -659,11 +741,6 @@ watch(currentLineId, async (newLineId, oldLineId) => {
   }
 
   selectedLine.value = buildLineItem(normalizedNew)
-
-  if (currentCity.value !== '伦敦') {
-    currentCity.value = '伦敦'
-    return
-  }
 
   await ensureLondonMap()
   await loadSelectedLineMap(false)
@@ -701,13 +778,17 @@ onBeforeUnmount(() => {
     leafletMap.value = null
   }
 })
+
+onMounted(() => {
+  loadFavorites()
+  ensureLondonMap()
+})
 </script>
 
 <template>
   <div class="app-shell">
-    <div class="map-canvas" :class="`map-canvas-${currentCity}`">
+    <div class="map-canvas map-canvas-伦敦">
       <div
-        v-show="currentCity === '伦敦'"
         ref="mapElement"
         class="leaflet-map-layer"
         :class="{ visible: londonMapReady }"
@@ -737,15 +818,6 @@ onBeforeUnmount(() => {
           {{ item }}
         </a>
       </nav>
-
-      <div class="topbar-actions">
-        <button class="icon-button" type="button" aria-label="消息提醒">
-          <span class="icon-bell"></span>
-        </button>
-        <button class="icon-button" type="button" aria-label="系统设置">
-          <span class="icon-gear"></span>
-        </button>
-      </div>
     </header>
 
     <aside class="sidebar">
@@ -763,11 +835,11 @@ onBeforeUnmount(() => {
           v-for="item in cityItems"
           :key="item.name"
           class="city-item"
-          :class="{ active: item.type === 'city' && currentCity === item.name }"
+          :class="{ active: item.type === 'city' && item.name === '伦敦' }"
           type="button"
           @click="selectSidebarItem(item)"
         >
-          <span class="city-icon"></span>
+          <span class="city-icon" :class="getSidebarIconClass(item)"></span>
           <span>{{ item.name }}</span>
         </button>
       </nav>
@@ -801,31 +873,120 @@ onBeforeUnmount(() => {
             </button>
           </div>
         </div>
-
-        <button class="primary-button" type="button" @click="submitLineSearch">
-          <span class="icon-bell small"></span>
-          搜索线路
-        </button>
       </div>
 
-      <div v-if="selectedLine" class="line-status-card" :class="lineStatus">
-        <div>
-          <strong>{{ selectedLine.displayName }}</strong>
-          <span>{{ lineStatusMessage || '已切换为站点到站信息视图' }}</span>
-        </div>
-        <small>提醒任务 {{ reminderTaskCount }} 个</small>
-      </div>
     </main>
 
-    <aside v-if="selectedLine && isLinePanelOpen" class="line-sidepanel">
-      <template v-if="activeDirection">
+    <aside v-if="isLinePanelOpen" class="line-sidepanel">
+      <template v-if="panelMode === 'favorites'">
+        <header class="line-panel-header">
+          <div>
+            <small>个人列表</small>
+            <h2>收藏线路</h2>
+          </div>
+          <div class="line-panel-header-actions">
+            <span class="line-panel-chip">{{ favoriteLines.length }} 条</span>
+            <button type="button" class="line-panel-close" @click="closeLinePanel">×</button>
+          </div>
+        </header>
+
+        <div v-if="favoriteLines.length" class="favorite-list">
+          <button
+            v-for="line in favoriteLines"
+            :key="line.id"
+            type="button"
+            class="favorite-item"
+            @click="openFavoriteLine(line)"
+          >
+            <span class="favorite-item-dot" :style="{ background: getLineColor(line.id) }"></span>
+            <div class="favorite-item-copy">
+              <strong>{{ line.displayName }}</strong>
+              <span>{{ line.city }} · {{ line.mode }}</span>
+            </div>
+            <span class="favorite-item-arrow">查看</span>
+          </button>
+        </div>
+
+        <div v-else class="line-panel-empty">
+          <strong>暂无收藏线路</strong>
+          <p>在某条线路的信息栏右上角点击星标后，这里会显示你收藏的公交线路。</p>
+        </div>
+      </template>
+
+      <template v-else-if="panelMode === 'reminders'">
+        <header class="line-panel-header">
+          <div>
+            <small>消息中心</small>
+            <h2>提醒中心</h2>
+          </div>
+          <div class="line-panel-header-actions">
+            <span class="line-panel-chip">{{ reminderTasks.length }} 项</span>
+            <button type="button" class="line-panel-close" @click="closeLinePanel">×</button>
+          </div>
+        </header>
+
+        <section class="panel-section">
+          <div class="panel-section-head">
+            <strong>提醒到站</strong>
+            <span>{{ reminderHistory.length }} 条</span>
+          </div>
+
+          <div v-if="reminderHistory.length" class="reminder-history-list">
+            <article v-for="item in reminderHistory" :key="item.id" class="reminder-history-item alert">
+              <strong>{{ item.title }}</strong>
+              <p>{{ item.message }}</p>
+            </article>
+          </div>
+
+          <div v-else class="line-panel-empty compact">
+            <strong>暂无到站提醒消息</strong>
+            <p>当设置的提醒被触发后，消息会显示在这里。</p>
+          </div>
+        </section>
+
+        <section class="panel-section">
+          <div class="panel-section-head">
+            <strong>我设置的提醒</strong>
+            <span>{{ reminderTasks.length }} 项</span>
+          </div>
+
+          <div v-if="reminderTasks.length" class="reminder-task-list">
+            <article v-for="task in reminderTasks" :key="task.id" class="reminder-task-item">
+              <div class="reminder-task-copy">
+                <strong>{{ task.lineName }}</strong>
+                <p>{{ task.stopName }} · {{ task.directionLabel }}</p>
+                <span>
+                  {{ task.mode === 'stops' ? `提前 ${task.stopsAhead} 站` : `提前 ${task.minutesAhead} 分钟` }}
+                </span>
+              </div>
+              <button type="button" class="reminder-task-remove" @click="removeReminderTask(task.id)">
+                删除
+              </button>
+            </article>
+          </div>
+
+          <div v-else class="line-panel-empty compact">
+            <strong>暂无已设置提醒</strong>
+            <p>在线路站点展开卡片里开启提醒后，会集中显示在这里。</p>
+          </div>
+        </section>
+      </template>
+
+      <template v-else-if="selectedLine && activeDirection">
         <header class="line-panel-header">
           <div>
             <small>{{ selectedLine.city }} · {{ selectedLine.mode }}</small>
             <h2>{{ selectedLine.displayName }}</h2>
           </div>
           <div class="line-panel-header-actions">
-            <span class="line-panel-chip">{{ activeStops.length }} 站</span>
+            <button
+              type="button"
+              class="favorite-toggle"
+              :class="{ active: isCurrentLineFavorite }"
+              @click="toggleFavoriteLine"
+            >
+              ★
+            </button>
             <button type="button" class="line-panel-close" @click="closeLinePanel">×</button>
           </div>
         </header>
@@ -889,11 +1050,21 @@ onBeforeUnmount(() => {
               <div class="reminder-box">
                 <div class="reminder-box-header">
                   <strong>到站提醒</strong>
-                  <span>页面内提示，不调用浏览器原生通知</span>
                 </div>
 
                 <div class="reminder-form">
                   <label class="reminder-field">
+                    <span>提醒方式</span>
+                    <select v-model="getReminderForm(activeDirectionId, stop.id).mode">
+                      <option value="stops">提前站数</option>
+                      <option value="minutes">提前时间</option>
+                    </select>
+                  </label>
+
+                  <label
+                    v-if="getReminderForm(activeDirectionId, stop.id).mode === 'stops'"
+                    class="reminder-field"
+                  >
                     <span>提前站数</span>
                     <select v-model.number="getReminderForm(activeDirectionId, stop.id).stopsAhead">
                       <option :value="1">提前 1 站</option>
@@ -902,7 +1073,10 @@ onBeforeUnmount(() => {
                     </select>
                   </label>
 
-                  <label class="reminder-field">
+                  <label
+                    v-if="getReminderForm(activeDirectionId, stop.id).mode === 'minutes'"
+                    class="reminder-field"
+                  >
                     <span>提前时间</span>
                     <select v-model.number="getReminderForm(activeDirectionId, stop.id).minutesAhead">
                       <option :value="1">1 分钟</option>
@@ -927,8 +1101,19 @@ onBeforeUnmount(() => {
       </div>
     </aside>
 
-    <div v-if="reminderToasts.length" class="toast-stack">
-      <div v-for="toast in reminderToasts" :key="toast.id" class="toast-card">
+    <div v-if="successToasts.length" class="toast-stack toast-stack-top">
+      <div v-for="toast in successToasts" :key="toast.id" class="toast-card toast-card-success">
+        <div class="toast-icon">✓</div>
+        <div>
+          <strong>提醒设置成功</strong>
+          <p>{{ toast.message }}</p>
+        </div>
+        <button type="button" class="toast-close toast-close-success" @click="dismissToast(toast.id)">知道了</button>
+      </div>
+    </div>
+
+    <div v-if="alertToasts.length" class="toast-stack">
+      <div v-for="toast in alertToasts" :key="toast.id" class="toast-card">
         <div>
           <strong>{{ toast.title }}</strong>
           <p>{{ toast.message }}</p>

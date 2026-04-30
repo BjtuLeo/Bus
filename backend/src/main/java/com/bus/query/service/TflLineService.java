@@ -6,7 +6,9 @@ import com.bus.query.model.LatLngDto;
 import com.bus.query.model.LineDirectionDto;
 import com.bus.query.model.LineMapResponse;
 import com.bus.query.model.LineSearchItem;
+import com.bus.query.model.LineTimetableResponse;
 import com.bus.query.model.StopMarkerDto;
+import com.bus.query.model.TimetableSectionDto;
 import com.bus.query.model.VehicleLegDto;
 import com.bus.query.model.VehiclePositionDto;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -56,12 +58,35 @@ public class TflLineService {
             return List.of();
         }
 
-        String lineId = extractLineId(query);
-        if (!StringUtils.hasText(lineId)) {
+        String prefix = extractLineId(query);
+        if (!StringUtils.hasText(prefix)) {
             return List.of();
         }
 
-        return List.of(buildLineSearchItem(lineId));
+        JsonNode lines = getJson(uriBuilder("/Line/Mode/{modes}").build("bus"));
+        if (!lines.isArray()) {
+            return List.of();
+        }
+
+        List<LineSearchItem> results = new ArrayList<>();
+        for (JsonNode lineNode : lines) {
+            String lineId = extractLineId(textValue(lineNode, "id"));
+            if (!StringUtils.hasText(lineId)) {
+                continue;
+            }
+
+            if (!lineId.startsWith(prefix)) {
+                continue;
+            }
+
+            results.add(buildLineSearchItem(lineId));
+        }
+
+        return results.stream()
+                .distinct()
+                .sorted(Comparator.comparing(LineSearchItem::id))
+                .limit(20)
+                .toList();
     }
 
     public LineMapResponse getLineMap(String lineId) {
@@ -82,7 +107,7 @@ public class TflLineService {
         LinkedHashMap<String, StopMarkerDto> mergedStops = new LinkedHashMap<>();
         for (StopMarkerDto stop : stops.values()) {
             List<ArrivalPredictionDto> predictions = augmentedArrivalMap.getOrDefault(stop.id(), List.of());
-            mergedStops.put(stop.id(), new StopMarkerDto(stop.id(), stop.name(), stop.lat(), stop.lng(), predictions));
+            mergedStops.put(stop.id(), new StopMarkerDto(stop.id(), stop.stopPointId(), stop.name(), stop.lat(), stop.lng(), predictions));
         }
         directions = applyArrivalsToDirections(directions, augmentedArrivalMap);
         if (directions.isEmpty()) {
@@ -127,6 +152,50 @@ public class TflLineService {
         );
     }
 
+    public LineTimetableResponse getTimetable(String lineId, String fromStopPointId) {
+        String normalizedLineId = extractLineId(lineId);
+        if (!StringUtils.hasText(normalizedLineId) || !StringUtils.hasText(fromStopPointId)) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "线路号和起点站点不能为空");
+        }
+
+        JsonNode routeSequence = getJson(uriBuilder("/Line/{id}/Route/Sequence/all").build(normalizedLineId));
+        List<StopMarkerDto> orderedStops = new ArrayList<>(extractStops(routeSequence).values());
+        JsonNode timetable = getJsonIfAvailable(uriBuilder("/Line/{id}/Timetable/{fromStopPointId}")
+                .build(normalizedLineId, fromStopPointId));
+
+        if (timetable != null) {
+            List<TimetableSectionDto> sections = extractTimetableSections(timetable);
+            if (!sections.isEmpty()) {
+                String lineName = firstNonBlank(
+                        textValue(timetable, "lineName"),
+                        normalizedLineId
+                );
+                String stopName = firstNonBlank(
+                        textValue(timetable.path("stationIntervals"), "stopName"),
+                        textValue(timetable.path("stopPoint"), "name"),
+                        findStopNameByStopPointId(fromStopPointId, orderedStops),
+                        fromStopPointId
+                );
+
+                return new LineTimetableResponse(
+                        normalizedLineId,
+                        lineName,
+                        fromStopPointId,
+                        stopName,
+                        sections
+                );
+            }
+        }
+
+        return new LineTimetableResponse(
+                normalizedLineId,
+                normalizedLineId,
+                fromStopPointId,
+                findStopNameByStopPointId(fromStopPointId, orderedStops),
+                List.of()
+        );
+    }
+
     private JsonNode getJson(URI uri) {
         try {
             String raw = restClient.get()
@@ -141,6 +210,19 @@ public class TflLineService {
                     "调用 TfL 接口失败，请检查网络或 TfL API Key 配置",
                     exception
             );
+        }
+    }
+
+    private JsonNode getJsonIfAvailable(URI uri) {
+        try {
+            String raw = restClient.get()
+                    .uri(uri)
+                    .retrieve()
+                    .body(String.class);
+
+            return objectMapper.readTree(Objects.requireNonNullElse(raw, "{}"));
+        } catch (Exception exception) {
+            return null;
         }
     }
 
@@ -186,6 +268,7 @@ public class TflLineService {
 
                 stops.put(id, new StopMarkerDto(
                         id,
+                        textValue(stopNode, "id"),
                         textValue(stopNode, "name"),
                         lat,
                         lng,
@@ -232,6 +315,7 @@ public class TflLineService {
 
                 orderedStops.add(new StopMarkerDto(
                         id,
+                        textValue(stopNode, "id"),
                         textValue(stopNode, "name"),
                         lat,
                         lng,
@@ -273,6 +357,7 @@ public class TflLineService {
                         direction.stops().stream()
                                 .map(stop -> new StopMarkerDto(
                                         stop.id(),
+                                        stop.stopPointId(),
                                         stop.name(),
                                         stop.lat(),
                                         stop.lng(),
@@ -818,6 +903,123 @@ public class TflLineService {
                 textValue(stopNode, "naptanId"),
                 textValue(stopNode, "id")
         );
+    }
+
+    private String findStopNameByStopPointId(String stopPointId, List<StopMarkerDto> orderedStops) {
+        return orderedStops.stream()
+                .filter(stop -> Objects.equals(stop.stopPointId(), stopPointId))
+                .map(StopMarkerDto::name)
+                .findFirst()
+                .orElse(stopPointId);
+    }
+
+    private List<TimetableSectionDto> extractTimetableSections(JsonNode timetable) {
+        JsonNode routes = timetable.path("timetable").path("routes");
+        if (!routes.isArray()) {
+            routes = timetable.path("routes");
+        }
+        if (!routes.isArray()) {
+            return List.of();
+        }
+
+        List<TimetableSectionDto> sections = new ArrayList<>();
+        for (JsonNode route : routes) {
+            String routeTitle = firstNonBlank(
+                    textValue(route, "name"),
+                    textValue(route, "destinationName"),
+                    textValue(route, "towards"),
+                    "发车班次"
+            );
+
+            JsonNode schedules = route.path("schedules");
+            if (!schedules.isArray()) {
+                continue;
+            }
+
+            for (JsonNode schedule : schedules) {
+                String scheduleTitle = firstNonBlank(
+                        textValue(schedule, "name"),
+                        textValue(schedule, "towards"),
+                        routeTitle
+                );
+                JsonNode knownJourneys = schedule.path("knownJourneys");
+                List<String> departures = new ArrayList<>();
+                if (knownJourneys.isArray()) {
+                    for (JsonNode journey : knownJourneys) {
+                        Integer hour = journey.path("hour").isNumber() ? journey.path("hour").asInt() : null;
+                        Integer minute = journey.path("minute").isNumber() ? journey.path("minute").asInt() : null;
+                        if (hour == null || minute == null) {
+                            continue;
+                        }
+                        departures.add(String.format(Locale.ROOT, "%02d:%02d", hour, minute));
+                    }
+                }
+
+                String firstDeparture = formatJourneyTime(schedule.path("firstJourney"));
+                String lastDeparture = formatJourneyTime(schedule.path("lastJourney"));
+                List<String> frequencies = extractFrequencySummaries(schedule.path("periods"));
+
+                if (!departures.isEmpty() || StringUtils.hasText(firstDeparture) || StringUtils.hasText(lastDeparture) || !frequencies.isEmpty()) {
+                    sections.add(new TimetableSectionDto(
+                            scheduleTitle,
+                            firstDeparture,
+                            lastDeparture,
+                            frequencies,
+                            departures.stream().distinct().limit(24).toList()
+                    ));
+                }
+            }
+        }
+
+        return sections;
+    }
+
+    private String formatJourneyTime(JsonNode journey) {
+        if (journey == null || journey.isMissingNode() || journey.isNull()) {
+            return "";
+        }
+        Integer hour = journey.path("hour").isNumber() ? journey.path("hour").asInt() : null;
+        Integer minute = journey.path("minute").isNumber() ? journey.path("minute").asInt() : null;
+        if (hour == null || minute == null) {
+            return "";
+        }
+        return String.format(Locale.ROOT, "%02d:%02d", hour, minute);
+    }
+
+    private List<String> extractFrequencySummaries(JsonNode periods) {
+        if (!periods.isArray()) {
+            return List.of();
+        }
+
+        List<String> summaries = new ArrayList<>();
+        for (JsonNode period : periods) {
+            String from = formatJourneyTime(period.path("fromTime"));
+            String to = formatJourneyTime(period.path("toTime"));
+            Integer minFrequency = period.path("minFrequency").isNumber() ? period.path("minFrequency").asInt() : null;
+            Integer maxFrequency = period.path("maxFrequency").isNumber() ? period.path("maxFrequency").asInt() : null;
+            Integer frequency = period.path("frequency").isNumber() ? period.path("frequency").asInt() : null;
+
+            String intervalText = "";
+            if (minFrequency != null && maxFrequency != null) {
+                intervalText = minFrequency.equals(maxFrequency)
+                        ? String.format(Locale.ROOT, "约每 %d 分钟一班", minFrequency)
+                        : String.format(Locale.ROOT, "约每 %d-%d 分钟一班", minFrequency, maxFrequency);
+            } else if (frequency != null) {
+                intervalText = String.format(Locale.ROOT, "约每 %d 分钟一班", frequency);
+            }
+
+            if (!StringUtils.hasText(intervalText)) {
+                continue;
+            }
+
+            if (StringUtils.hasText(from) && StringUtils.hasText(to)) {
+                summaries.add(String.format(Locale.ROOT, "%s - %s %s", from, to, intervalText));
+            } else {
+                summaries.add(intervalText);
+            }
+        }
+
+        return summaries.stream().distinct().toList();
     }
 
     private LineSearchItem buildLineSearchItem(String lineId) {

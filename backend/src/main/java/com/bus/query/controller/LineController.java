@@ -2,6 +2,7 @@ package com.bus.query.controller;
 
 import com.bus.query.model.LineMapResponse;
 import com.bus.query.model.LineSearchItem;
+import com.bus.query.model.LineTimetableResponse;
 import com.bus.query.service.TflLineService;
 import jakarta.validation.constraints.NotBlank;
 import java.util.List;
@@ -31,5 +32,10 @@ public class LineController {
     @GetMapping("/{lineId}/map")
     public LineMapResponse lineMap(@PathVariable String lineId) {
         return tflLineService.getLineMap(lineId);
+    }
+
+    @GetMapping("/{lineId}/timetable/{fromStopPointId}")
+    public LineTimetableResponse timetable(@PathVariable String lineId, @PathVariable String fromStopPointId) {
+        return tflLineService.getTimetable(lineId, fromStopPointId);
     }
 }

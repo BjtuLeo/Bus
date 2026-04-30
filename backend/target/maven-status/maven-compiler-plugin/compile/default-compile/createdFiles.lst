@@ -1,5 +1,7 @@
+com/bus/query/model/TimetableSectionDto.class
 com/bus/query/model/LineDirectionDto.class
 com/bus/query/controller/LineController.class
+com/bus/query/model/LineTimetableResponse.class
 com/bus/query/service/TflLineService.class
 com/bus/query/config/WebConfig.class
 com/bus/query/model/LineSearchItem.class
